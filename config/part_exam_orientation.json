@@ -1,0 +1,115 @@
+{
+    "下肢": [
+        "frontal position",
+        "lateral position"
+    ],
+    "肘关节": [
+        "frontal position",
+        "lateral position"
+    ],
+    "盆部": [
+        "frontal position",
+        "lateral position",
+        "oblique position",
+        "special position"
+
+    ],
+    "足部": [
+        "oblique position",
+        "frontal position",
+        "lateral position",
+        "axial position"
+    ],
+    "脊柱": [
+        "frontal position",
+        "lateral position",
+        "lateral position"
+    ],
+    "大腿": [
+        "frontal position",
+        "lateral position"
+    ],
+    "腹部": [
+        "frontal position",
+        "lateral position"
+    ],
+    "踝关节": [
+        "frontal position",
+        "lateral position",
+        "special position"
+    ],
+    "颜面": [
+        "lateral position",
+        "frontal position",
+        "special position"
+    ],
+    "腕关节": [
+        "frontal position",
+        "lateral position",
+        "special position",
+        "oblique position"
+    ],
+    "肩部": [
+        "frontal position",
+        "oblique position"
+    ],
+    "腰椎": [
+        "frontal position",
+        "lateral position",
+        "oblique position",
+        "lateral position"
+    ],
+    "骶髂关节": [
+        "oblique position",
+        "frontal position",
+        "oblique position"
+    ],
+    "胸椎": [
+        "frontal position",
+        "lateral position"
+    ],
+    "颈椎": [
+        "frontal position",
+        "lateral position",
+        "lateral position",
+        "oblique position"
+    ],
+    "小腿": [
+        "frontal position",
+        "lateral position"
+    ],
+    "颅脑": [
+        "frontal position",
+        "lateral position",
+        "special position",
+        "lateral position"
+    ],
+    "跟骨": [
+        "axial position",
+        "lateral position"
+    ],
+    "膝关节": [
+        "frontal position",
+        "lateral position",
+        "axial position"
+    ],
+    "胸部": [
+        "frontal position",
+        "lateral position",
+        "oblique position"
+    ],
+    "手": [
+        "oblique position",
+        "frontal position",
+        "lateral position"
+    ],
+    "骶尾椎": [
+        "lateral position",
+        "frontal position"
+    ],
+    "乳房": [
+        "cephalocaudal position",
+        "axillary tail position",
+        "spot compression position"
+    ]
+}
