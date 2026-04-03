@@ -217,6 +217,24 @@ USE_BGE_RERANK = os.getenv('USE_BGE_RERANK', 'true').lower() == 'true'
 RERANK_THRESHOLD = float(os.getenv('RERANK_THRESHOLD', '0.7'))
 FALLBACK_TO_WORD2VEC = os.getenv('FALLBACK_TO_WORD2VEC', 'true').lower() == 'true'
 
+# 新重构的报告结论检查模块（可选切换）
+USE_NEW_CONCLUSION_CHECKER = os.getenv('USE_NEW_CONCLUSION_CHECKER', 'false').lower() == 'true'
+if USE_NEW_CONCLUSION_CHECKER:
+    try:
+        from report_analyze.report_conclusion_checker import check_report_conclusion as check_report_conclusion_new
+    except ImportError as e:
+        print(f"Warning: 无法导入新的结论检查模块: {e}")
+        USE_NEW_CONCLUSION_CHECKER = False
+
+# 新重构的矛盾检查模块（可选切换）
+USE_NEW_CONTRADICTION_CHECKER = os.getenv('USE_NEW_CONTRADICTION_CHECKER', 'false').lower() == 'true'
+if USE_NEW_CONTRADICTION_CHECKER:
+    try:
+        from report_analyze.contradiction_checker import check_contradiction as check_contradiction_new
+    except ImportError as e:
+        print(f"Warning: 无法导入新的矛盾检查模块: {e}")
+        USE_NEW_CONTRADICTION_CHECKER = False
+
 # 初始化语义匹配器
 _matcher = None
 def get_semantic_matcher():
@@ -528,7 +546,7 @@ def detect_abnormal_medical_terms(sentence: str) -> List[str]:
 
 def CheckSex(all_analyze, Sex: str):  # 检查性别错误
     if len(all_analyze) == 0:
-        return "未发现性别错误"
+        return ""
     global MaleKeyWords, FemaleKeyWords
     body_part = []
     [body_part.extend(get_all_partlist_elements(d)) for d in all_analyze]
@@ -542,11 +560,11 @@ def CheckSex(all_analyze, Sex: str):  # 检查性别错误
         mat = re.findall(MaleKeyWords," ".join(body_part))
         if mat:
             return ("女性报告中出现：%s" % "；".join(mat))
-    return "未发现性别错误"
+    return ""
 
 def CheckMeasure(Str):  # 检查测量值错误
     if Str.strip() == "":
-        return "未发现测量单位明显错误"
+        return ""
     global mm_max, cm_max, m_max
     Str = Str.replace("*", "×")
     Str=re.sub("ml","毫升",Str,flags=re.I)
@@ -617,7 +635,7 @@ def CheckMeasure(Str):  # 检查测量值错误
     if len(result) > 0:
         return ("测量值%s过大，请检查" % result)
     else:
-        return "未发现测量单位明显错误"
+        return ""
 #检查部位缺失
 def part_missing(studypart_analyze, ReportStr_analyze, Conclusion_analyze, modality):
     """检查部位缺失."""
@@ -699,7 +717,11 @@ def applytable_error(apply_analyze,studypart_analyze, ReportStr_analyze, Conclus
         # all_analyze=[d for d in all_analyze if d['positive']]
         if all_analyze==[]:
             return ""
-        _,inverse=Check_report_conclusion(apply_parts, all_analyze,  modality)
+        # 使用新模块或旧函数
+        if USE_NEW_CONCLUSION_CHECKER:
+            _, inverse = check_report_conclusion_new(apply_parts, all_analyze, modality)
+        else:
+            _, inverse = Check_report_conclusion(apply_parts, all_analyze, modality)
         if inverse:
             result= f"以下可能存在方位不符:{'；'.join(inverse)}"
             return result.replace("[描述]", "[报告]").replace("[结论]", "[申请单]")
@@ -832,47 +854,58 @@ def Check_report_conclusion(Conclusion_analyze, ReportStr_analyze,modality):
                                                      (x['orientation']=='右' and s['orientation']=='左'))]
                 
                 # === BGE + Rerank 语义匹配 (新增) ===
-                use_rerank = USE_BGE_RERANK and len(orient_match_list) > 0
+                # 注意：Rerank用于判断描述和结论是否语义匹配，不应该过滤掉方位不匹配的候选
+                # 因为方位错误检测需要保留方位不匹配的项到similarity_list
+                use_rerank = USE_BGE_RERANK and len(position_find_list) > 0
+                rerank_found_match = False
+                
                 if use_rerank:
-                    best_match, rerank_score = check_match_with_rerank(s, orient_match_list)
+                    best_match, rerank_score = check_match_with_rerank(s, position_find_list)
                     if rerank_score == -1 and FALLBACK_TO_WORD2VEC:
                         # API失败，回退到Word2Vec
                         use_rerank = False
                     elif best_match is None:
-                        # Rerank认为没有足够相似的匹配
-                        entity_missing = True
-                        missing_find = True  # 保持原有变量兼容
-                        position_find_list = []  # 清空候选列表
+                        # Rerank认为没有足够相似的匹配，可能是真缺失
+                        # 但要保留所有候选用于后续方位错误检测
+                        pass
                     else:
-                        # Rerank找到匹配
+                        # Rerank找到匹配，说明描述在结论中有对应（无论方位是否匹配）
+                        # 方位匹配 → 不是缺失
+                        # 方位不匹配 → 可能是方位错误，也不是缺失
+                        rerank_found_match = True
                         entity_missing = False
                         missing_find = False
-                        position_find_list = [best_match]  # 只保留最佳匹配
-                else:
+                
+                # 如果没有使用Rerank或Rerank失败/回退，使用原有逻辑
+                if not use_rerank:
                     if orient_match_list:
                         entity_missing = False
                         missing_find = False
+                
+                # === 构建similarity_list用于方位错误检测 ===
+                # 注意：无论Rerank结果如何，都需要将所有候选加入similarity_list
+                # 因为方位错误检测需要比较方位不匹配的情况
+                if s['positive'] > 1:
+                    position_find_list_filtered = [d for d in position_find_list if d['ignore']==False]
+                else:
+                    position_find_list_filtered = position_find_list
                     
-                # === 原有Word2Vec逻辑 ===
-                if not use_rerank and entity_missing == False:
-                    if s['positive'] > 1:
-                        position_find_list=[d for d in position_find_list if d['ignore']==False]
-                    for position_find in position_find_list:
-                        if not position_in_any_partlist(position_find['position'], s):
-                            continue
-                        if re.search(orient_ignore,s['original_short_sentence']) is not None or re.search(orient_ignore,position_find['original_short_sentence']) is not None:
-                            continue
-                        semantics=struc_sim(position_find,s)
-                        if semantics>0 and s['positive'] > 1:
-                            similarity_list.append({'report':s['original_short_sentence'].split(",")[0],
-                                                    'report_orientation':s['orientation'],
-                                                    'positive':s['positive'],
-                                                    'report_position':s['position'],
-                                                    'conclusion_position':position_find['position'],
-                                                    'conclusion':position_find['original_short_sentence'].split(",")[0],
-                                                    'conclusion_orientation':position_find['orientation'],
-                                                    'semantics': semantics
-                                                    })
+                for position_find in position_find_list_filtered:
+                    if not position_in_any_partlist(position_find['position'], s):
+                        continue
+                    if re.search(orient_ignore,s['original_short_sentence']) is not None or re.search(orient_ignore,position_find['original_short_sentence']) is not None:
+                        continue
+                    semantics=struc_sim(position_find,s)
+                    if semantics>0 and s['positive'] > 1:
+                        similarity_list.append({'report':s['original_short_sentence'].split(",")[0],
+                                                'report_orientation':s['orientation'],
+                                                'positive':s['positive'],
+                                                'report_position':s['position'],
+                                                'conclusion_position':position_find['position'],
+                                                'conclusion':position_find['original_short_sentence'].split(",")[0],
+                                                'conclusion_orientation':position_find['orientation'],
+                                                'semantics': semantics
+                                                })
             
             # 检查当前实体是否缺失结论（立即处理，不依赖循环变量）
             if entity_missing and s['positive'] > 1 and s.get('ignore', False) == False:
@@ -917,7 +950,7 @@ def Check_report_conclusion(Conclusion_analyze, ReportStr_analyze,modality):
         conclusion_missing=[x for x in conclusion_missing if orient['report'] not in x]
     conclusion_missing = [x for x in set(conclusion_missing) if miss_ignore_pattern.search(x)==None]
     return conclusion_missing, orient_error
-# 语言矛盾:
+
 
 def check_contradiction(ReportStr_analyze, Conclusion_analyze,modality):
     """检查报告矛盾语句."""
@@ -1120,6 +1153,383 @@ def CheckRADS(StudyPartStr:str,ConclusionStr:str,modality:str):
     return ""
 
 
+# %% LLM验证函数 - 并发批量验证所有类型错误
+
+def _batch_validate_with_llm(
+    conclusion_missing_list: list,
+    orient_error_list: list,
+    contradiction_list: list,
+    description: str,
+    conclusion: str
+) -> tuple:
+    """
+    统一批量LLM验证函数 - 并发验证所有类型的错误
+    
+    将结论缺失、方位错误、矛盾检测的结果一起提交给LLM进行批量验证，
+    减少多次调用的开销，提高处理速度。
+    
+    Args:
+        conclusion_missing_list: 结论缺失列表
+        orient_error_list: 方位错误列表
+        contradiction_list: 矛盾列表（成对出现）
+        description: 报告描述原文
+        conclusion: 报告结论原文
+        
+    Returns:
+        tuple: (filtered_conclusion_missing, filtered_orient_error, filtered_contradiction)
+    """
+    # 检查是否需要验证
+    has_conclusion_missing = bool(conclusion_missing_list)
+    has_orient_error = bool(orient_error_list)
+    has_contradiction = bool(contradiction_list and len(contradiction_list) >= 2)
+    
+    if not (has_conclusion_missing or has_orient_error or has_contradiction):
+        return conclusion_missing_list, orient_error_list, contradiction_list
+    
+    if os.getenv('USE_LLM_VALIDATION', 'true').lower() != 'true':
+        return conclusion_missing_list, orient_error_list, contradiction_list
+    
+    try:
+        validator = get_llm_validator()
+        if not validator.available():
+            return conclusion_missing_list, orient_error_list, contradiction_list
+        
+        # 构建统一的验证候选列表
+        candidates = []
+        
+        # 1. 结论缺失候选
+        for item in conclusion_missing_list:
+            candidates.append({
+                'type': 'conclusion_missing',
+                'description': description,
+                'conclusion': conclusion,
+                'suspected': item,
+                '_original': item
+            })
+        
+        # 2. 方位错误候选
+        for item in orient_error_list:
+            match = re.search(r'\[描述\](.+?)；\[结论\](.+)', item)
+            if match:
+                candidates.append({
+                    'type': 'orient_error',
+                    'description': match.group(1),
+                    'conclusion': match.group(2),
+                    '_original': item
+                })
+            else:
+                # 格式不匹配，直接保留
+                candidates.append({
+                    'type': 'orient_error',
+                    'description': item,
+                    'conclusion': '',
+                    '_original': item,
+                    '_keep': True  # 标记为直接保留
+                })
+        
+        # 3. 矛盾候选（成对出现）
+        for i in range(0, len(contradiction_list) - 1, 2):
+            stmt1 = contradiction_list[i]
+            stmt2 = contradiction_list[i + 1] if i + 1 < len(contradiction_list) else ''
+            if isinstance(stmt1, str) and isinstance(stmt2, str):
+                candidates.append({
+                    'type': 'contradiction',
+                    'statement1': stmt1,
+                    'statement2': stmt2,
+                    '_pair_idx': i // 2
+                })
+        
+        if not candidates:
+            return conclusion_missing_list, orient_error_list, contradiction_list
+        
+        # 批量LLM验证（一次调用验证所有）
+        validated = validator.batch_validate(candidates)
+        
+        # 分别收集结果
+        confirmed_conclusion_missing = []
+        conclusion_needs_review = []
+        
+        confirmed_orient_error = []
+        orient_needs_review = []
+        
+        confirmed_contradiction = []
+        contradiction_needs_review = []
+        
+        for v in validated:
+            vtype = v.get('type', '')
+            
+            if vtype == 'conclusion_missing':
+                original = v.get('_original', '')
+                if v.get('needs_review'):
+                    conclusion_needs_review.append(original)
+                elif not v.get('weak_positive') and v.get('confidence', 0.5) >= 0.7:
+                    confirmed_conclusion_missing.append(original)
+                elif v.get('weak_positive'):
+                    confirmed_conclusion_missing.append(f"[弱阳性]{original}")
+                # 低置信度丢弃
+                
+            elif vtype == 'orient_error':
+                if v.get('_keep'):
+                    # 格式不匹配的直接保留
+                    confirmed_orient_error.append(v.get('_original', ''))
+                    continue
+                    
+                original = v.get('_original', '')
+                if v.get('needs_review'):
+                    orient_needs_review.append(original)
+                elif not v.get('weak_positive') and v.get('confidence', 0.5) >= 0.7:
+                    confirmed_orient_error.append(original)
+                elif v.get('weak_positive'):
+                    confirmed_orient_error.append(f"[弱阳性]{original}")
+                # 低置信度丢弃
+                
+            elif vtype == 'contradiction':
+                stmt1 = v.get('statement1', '')
+                stmt2 = v.get('statement2', '')
+                if v.get('needs_review'):
+                    contradiction_needs_review.append((stmt1, stmt2))
+                elif not v.get('weak_positive') and v.get('confidence', 0.5) >= 0.7:
+                    confirmed_contradiction.extend([stmt1, stmt2])
+                elif v.get('weak_positive'):
+                    confirmed_contradiction.extend([f"[弱阳性]{stmt1}", f"[弱阳性]{stmt2}"])
+                # 低置信度丢弃
+        
+        # 添加待审核标记
+        if conclusion_needs_review:
+            confirmed_conclusion_missing.append(f"[待审核]{len(conclusion_needs_review)}项")
+        if orient_needs_review:
+            confirmed_orient_error.append(f"[待审核]{len(orient_needs_review)}项")
+        if contradiction_needs_review:
+            confirmed_contradiction.append(f"[待审核]{len(contradiction_needs_review)}项")
+        
+        return (
+            confirmed_conclusion_missing if confirmed_conclusion_missing else [],
+            confirmed_orient_error if confirmed_orient_error else [],
+            confirmed_contradiction if confirmed_contradiction else []
+        )
+        
+    except Exception as e:
+        print(f"批量LLM验证失败: {e}")
+        # 失败时保留原结果
+        return conclusion_missing_list, orient_error_list, contradiction_list
+
+
+# 保留旧函数以向后兼容（可选，新代码应使用_batch_validate_with_llm）
+def _validate_conclusion_missing_with_llm(conclusion_missing_list: list, description: str, conclusion: str) -> list:
+    """使用LLM验证结论缺失问题，过滤假阳性
+    
+    仅当规则引擎返回 conclusion_missing 不为空时才会被调用。
+    LLM的作用是阻拦规则引擎的假阳性，保留高置信度的真阳性。
+    
+    Args:
+        conclusion_missing_list: 规则引擎检测到的结论缺失列表
+        description: 报告描述原文
+        conclusion: 报告结论原文
+        
+    Returns:
+        经过LLM验证过滤后的结论缺失列表
+    """
+    if not conclusion_missing_list:
+        return conclusion_missing_list
+    
+    if os.getenv('USE_LLM_VALIDATION', 'true').lower() != 'true':
+        return conclusion_missing_list
+    
+    try:
+        validator = get_llm_validator()
+        if not validator.available():
+            return conclusion_missing_list
+        
+        # 构建验证候选
+        candidates = []
+        for item in conclusion_missing_list:
+            candidates.append({
+                'type': 'conclusion_missing',
+                'description': description,
+                'conclusion': conclusion,
+                'suspected': item
+            })
+        
+        # LLM批量验证
+        validated = validator.batch_validate(candidates)
+        
+        # 收集验证结果：只保留高置信度真阳性
+        confirmed_missing = []
+        needs_review = []
+        
+        for v in validated:
+            if v.get('needs_review'):
+                # LLM验证失败或超时，标记为待审核
+                needs_review.append(v)
+            elif not v.get('weak_positive') and v.get('confidence', 0.5) >= 0.7:
+                # 高置信度真阳性
+                confirmed_missing.append(v['suspected'])
+            elif v.get('weak_positive'):
+                # 中置信度，标记弱阳性但仍保留
+                confirmed_missing.append(f"[弱阳性]{v['suspected']}")
+            # 低置信度视为假阳性，丢弃
+        
+        # 添加待审核标记
+        if needs_review:
+            confirmed_missing.append(f"[待审核]{len(needs_review)}项")
+        
+        return confirmed_missing if confirmed_missing else []
+        
+    except Exception as e:
+        print(f"结论缺失LLM验证失败: {e}")
+        return conclusion_missing_list  # 失败时保留原结果
+
+
+def _validate_orient_error_with_llm(orient_error_list: list) -> list:
+    """使用LLM验证方位错误问题，过滤假阳性
+    
+    仅当规则引擎返回 orient_error 不为空时才会被调用。
+    LLM的作用是阻拦规则引擎的假阳性，保留高置信度的真阳性。
+    
+    Args:
+        orient_error_list: 规则引擎检测到的方位错误列表
+        格式: ["[描述]xxx；[结论]xxx", ...]
+        
+    Returns:
+        经过LLM验证过滤后的方位错误列表
+    """
+    if not orient_error_list:
+        return orient_error_list
+    
+    if os.getenv('USE_LLM_VALIDATION', 'true').lower() != 'true':
+        return orient_error_list
+    
+    try:
+        validator = get_llm_validator()
+        if not validator.available():
+            return orient_error_list
+        
+        # 构建验证候选
+        candidates = []
+        original_items = {}  # 保存原始项用于后续映射
+        
+        for idx, item in enumerate(orient_error_list):
+            # 解析方位错误格式：[描述]...；[结论]...
+            match = re.search(r'\[描述\](.+?)；\[结论\](.+)', item)
+            if match:
+                candidates.append({
+                    'type': 'orient_error',
+                    'description': match.group(1),
+                    'conclusion': match.group(2),
+                    'original': item,
+                    '_idx': idx
+                })
+                original_items[idx] = item
+            else:
+                # 格式不匹配，直接保留
+                original_items[idx] = item
+        
+        if not candidates:
+            return orient_error_list
+        
+        # LLM批量验证
+        validated = validator.batch_validate(candidates)
+        
+        # 收集验证结果
+        confirmed_errors = []
+        needs_review = []
+        
+        for v in validated:
+            original_item = v.get('original', '')
+            
+            if v.get('needs_review'):
+                needs_review.append(original_item)
+            elif not v.get('weak_positive') and v.get('confidence', 0.5) >= 0.7:
+                # 高置信度真阳性
+                confirmed_errors.append(original_item)
+            elif v.get('weak_positive'):
+                # 中置信度，标记弱阳性
+                confirmed_errors.append(f"[弱阳性]{original_item}")
+            # 低置信度视为假阳性，丢弃
+        
+        # 添加待审核标记
+        if needs_review:
+            confirmed_errors.append(f"[待审核]{len(needs_review)}项")
+        
+        return confirmed_errors if confirmed_errors else []
+        
+    except Exception as e:
+        print(f"方位错误LLM验证失败: {e}")
+        return orient_error_list  # 失败时保留原结果
+
+
+def _validate_contradiction_with_llm(contradiction_list: list) -> list:
+    """使用LLM验证语言矛盾问题，过滤假阳性
+    
+    仅当规则引擎返回 contradiction 不为空时才会被调用。
+    LLM的作用是阻拦规则引擎的假阳性，保留高置信度的真阳性。
+    
+    Args:
+        contradiction_list: 规则引擎检测到的矛盾列表
+        格式: [stmt1, stmt2, stmt3, stmt4, ...] 成对出现
+        
+    Returns:
+        经过LLM验证过滤后的矛盾列表
+    """
+    if not contradiction_list or len(contradiction_list) < 2:
+        return contradiction_list
+    
+    if os.getenv('USE_LLM_VALIDATION', 'true').lower() != 'true':
+        return contradiction_list
+    
+    try:
+        validator = get_llm_validator()
+        if not validator.available():
+            return contradiction_list
+        
+        # 构建验证候选（矛盾成对出现）
+        candidates = []
+        for i in range(0, len(contradiction_list) - 1, 2):
+            stmt1 = contradiction_list[i]
+            stmt2 = contradiction_list[i + 1] if i + 1 < len(contradiction_list) else ''
+            if isinstance(stmt1, str) and isinstance(stmt2, str):
+                candidates.append({
+                    'type': 'contradiction',
+                    'statement1': stmt1,
+                    'statement2': stmt2,
+                    '_pair_idx': i // 2
+                })
+        
+        if not candidates:
+            return contradiction_list
+        
+        # LLM批量验证
+        validated = validator.batch_validate(candidates)
+        
+        # 收集验证结果
+        confirmed_contradictions = []
+        needs_review = []
+        
+        for v in validated:
+            stmt1 = v.get('statement1', '')
+            stmt2 = v.get('statement2', '')
+            
+            if v.get('needs_review'):
+                needs_review.append((stmt1, stmt2))
+            elif not v.get('weak_positive') and v.get('confidence', 0.5) >= 0.7:
+                # 高置信度真阳性
+                confirmed_contradictions.extend([stmt1, stmt2])
+            elif v.get('weak_positive'):
+                # 中置信度，标记弱阳性
+                confirmed_contradictions.extend([f"[弱阳性]{stmt1}", f"[弱阳性]{stmt2}"])
+            # 低置信度视为假阳性，丢弃
+        
+        # 添加待审核标记
+        if needs_review:
+            confirmed_contradictions.append(f"[待审核]{len(needs_review)}项")
+        
+        return confirmed_contradictions if confirmed_contradictions else []
+        
+    except Exception as e:
+        print(f"矛盾LLM验证失败: {e}")
+        return contradiction_list  # 失败时保留原结果
+
+
 # %%报告医生质控函数
 def Report_Quality(ReportTxt: Report, debug=False):
     """对初诊医生的报告进行质控，返回阳性率、报告错误等信息."""
@@ -1135,12 +1545,10 @@ def Report_Quality(ReportTxt: Report, debug=False):
                                       modality=ReportTxt.modality, add_info=studypart_analyze) if ReportTxt.applyTable else []
     
     # 为所有实体添加 ignore 字段
-    studypart_analyze = add_ignore_field(studypart_analyze)
+    # studypart_analyze = add_ignore_field(studypart_analyze)
     Conclusion_analyze = add_ignore_field(Conclusion_analyze)
     ReportStr_analyze = add_ignore_field(ReportStr_analyze)
-    apply_analyze = add_ignore_field(apply_analyze)
-    StandardPart = set()
-    GetPositivelist = {}
+    # apply_analyze = add_ignore_field(apply_analyze)
     missing = []
     inverse = []
     special_missing = []
@@ -1167,19 +1575,29 @@ def Report_Quality(ReportTxt: Report, debug=False):
 
     # 检查描述与结论相符
     if "骨龄" not in ReportTxt.StudyPart:
-        conclusion_missing, orient_error = Check_report_conclusion(
-                                            Conclusion_analyze, ReportStr_analyze,ReportTxt.modality)
-    # if len(conclusion_missing)>1:
-    #     conclusion_missing ="结论可能遗漏: " + "；".join(f"{i+1}.{item}" for i,item in enumerate(conclusion_missing))
-    # else:
-    #     conclusion_missing = "未检查到描述与结论不符" if not conclusion_missing else "结论可能遗漏: " + "".join(conclusion_missing)
-    # orient_error = "未检查到描述与结论方位不符" if not orient_error else "以下描述与结论可能方位不符: " + \
-    #     "；".join(orient_error)
-
+        if USE_NEW_CONCLUSION_CHECKER:
+            conclusion_missing, orient_error = check_report_conclusion_new(
+                                                Conclusion_analyze, ReportStr_analyze, ReportTxt.modality)
+        else:
+            conclusion_missing, orient_error = Check_report_conclusion(
+                                                Conclusion_analyze, ReportStr_analyze, ReportTxt.modality)
+    
     # 检查矛盾
-    contradiction = check_contradiction(ReportStr_analyze, Conclusion_analyze,ReportTxt.modality)
-    # contradiction = "未检测到语言矛盾" if not contradiction else "以下语言可能矛盾： " + \
-    #     "；".join(contradiction)
+    if USE_NEW_CONTRADICTION_CHECKER:
+        contradiction = check_contradiction_new(ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
+    else:
+        contradiction = check_contradiction(ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
+    
+    # === Stage 2-4: 统一批量LLM验证 ===
+    # 收集所有需要验证的结果，一次性批量验证，提高效率
+    if conclusion_missing or orient_error or contradiction:
+        conclusion_missing, orient_error, contradiction = _batch_validate_with_llm(
+            conclusion_missing,
+            orient_error,
+            contradiction,
+            ReportTxt.ReportStr,
+            ReportTxt.ConclusionStr
+        )
 
     # 检查性别错误
     all_analyze = ReportStr_analyze + Conclusion_analyze
@@ -1223,72 +1641,6 @@ def Report_Quality(ReportTxt: Report, debug=False):
     #检查RADS分类
     RADS=CheckRADS(ReportTxt.StudyPart, ReportTxt.ConclusionStr,ReportTxt.modality)
     
-    # === Stage 2: LLM后置精筛（新增）===
-    if os.getenv('USE_LLM_VALIDATION', 'true').lower() == 'true':
-        try:
-            validator = get_llm_validator()
-            if validator.available():
-                # 转换并验证结论缺失
-                if conclusion_missing:
-                    conclusion_candidates = []
-                    for item in conclusion_missing:
-                        conclusion_candidates.append({
-                            'type': 'conclusion_missing',
-                            'description': ReportTxt.ReportStr,
-                            'conclusion': ReportTxt.ConclusionStr,
-                            'suspected': item
-                        })
-                    validated = validator.batch_validate(conclusion_candidates)
-                    conclusion_missing = [v['suspected'] for v in validated if not v.get('needs_review')]
-                    
-                    # 添加待审核标记
-                    needs_review_missing = [v for v in validated if v.get('needs_review')]
-                    if needs_review_missing:
-                        conclusion_missing.append(f"[待审核]{len(needs_review_missing)}项")
-                
-                # 转换并验证方位错误
-                if orient_error:
-                    orient_candidates = []
-                    for item in orient_error:
-                        # 解析方位错误格式：[描述]...；[结论]...
-                        match = re.search(r'\[描述\](.+?)；\[结论\](.+)', item)
-                        if match:
-                            orient_candidates.append({
-                                'type': 'orient_error',
-                                'description': match.group(1),
-                                'conclusion': match.group(2)
-                            })
-                    validated = validator.batch_validate(orient_candidates)
-                    orient_error = [v.get('original', item) for v in validated if not v.get('needs_review')]
-                    
-                    needs_review_orient = [v for v in validated if v.get('needs_review')]
-                    if needs_review_orient:
-                        orient_error.append(f"[待审核]{len(needs_review_orient)}项")
-                
-                # 转换并验证矛盾
-                if contradiction and len(contradiction) >= 2:
-                    contradiction_candidates = []
-                    # 矛盾是成对出现的
-                    for i in range(0, len(contradiction)-1, 2):
-                        contradiction_candidates.append({
-                            'type': 'contradiction',
-                            'statement1': contradiction[i],
-                            'statement2': contradiction[i+1] if i+1 < len(contradiction) else ''
-                        })
-                    validated = validator.batch_validate(contradiction_candidates)
-                    validated_contradiction = []
-                    for v in validated:
-                        if not v.get('needs_review'):
-                            validated_contradiction.extend([v['statement1'], v['statement2']])
-                    contradiction = validated_contradiction
-                    
-                    needs_review_contra = [v for v in validated if v.get('needs_review')]
-                    if needs_review_contra:
-                        contradiction.append(f"[待审核]{len(needs_review_contra)}项")
-        except Exception as e:
-            print(f"LLM validation error: {e}")
-            # 错误时保留规则引擎结果
-    
     if debug:
         end_time = time.time()
         print("耗时:%.2f秒" % (end_time-start_time))
@@ -1315,16 +1667,17 @@ if __name__ == "__main__":
     # 报告医生数据结构
     a = Report(
         ReportStr = """
-与2021/2/3日片比较(号码:035779):
-     两肺纹理增多、模糊，双肺支气管扩张，部分似“双轨”排列，见散在结节状及小片状模糊影，较前进展，右肺上叶可见多发钙化影；右肺下叶后底段结节影现片观察欠清。纵隔数枚淋巴结增大，较大者短径约15mmm，双侧肺门未见增大淋巴结。心脏和大血管结构未见异常。双侧胸腔见积液。
+    两肺纹理增多、紊乱，右下肺前内基底段见不规则团片影，周边见少许毛刺，径约25×18mm；左肺上叶舌段少许条索影。
+    气管支气管畅顺，壁不厚。纵隔内未见肿大淋巴结，双侧胸腔无积液，胸膜不厚。附见：甲状腺右叶肿大，并突向纵隔生长。
         """,
    ConclusionStr = """
-1、双肺支气管扩张伴感染，较前进展，建议继续治疗后复查；纵隔数枚淋巴结增大。
-2、右肺下叶后底段结节现片观察欠清。
-3、附见：甲状腺左叶低密度灶；胆囊结石。
+1.左下肺前内基底段不规则团片影，性质待定，建议增强。
+2.慢支炎；左肺上叶舌段少许慢性炎症。
+3.附见：甲状腺右叶肿大突向纵隔后生长，建议专科检查。
+
    """,
-        StudyPart = '胸部/肺平扫(去除文胸，项链等）',
-        Sex = '女',
+        StudyPart = '胸部(肺)',
+        Sex = '男',
         modality = "CT",
         applyTable=""
  

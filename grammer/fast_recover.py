@@ -39,6 +39,13 @@ try:
 except ImportError:
     np = None
 
+# 强制导入jieba - 词语级n-gram必需
+try:
+    import jieba
+    jieba.load_userdict("config/user_dic_expand.txt")
+except ImportError:
+    raise ImportError("jieba分词库是必需的，请安装: pip install jieba")
+
 
 @dataclass
 class SuspiciousFragment:
@@ -59,21 +66,29 @@ class CharacterAnomalyDetector:
     - 从360万报告中统计单字/双字/三字频率
     - Trigram对医学文本更可靠，因为医学术语多为固定3字搭配
     - 例如："肺纹理增粗" - "肺纹理"是正常trigram，"肺文里"是异常
+    
+    根本改进（v2.0）：
+    - 使用词语级 n-gram 而非字符级
+    - "左心房稍缩小" -> 分词 ['左心房', '稍', '缩小']
+    - 词语级 trigram: ('左心房', '稍', '缩小') - 不跨越词边界
+    - 不会再出现 '房稍缩' 这种跨边界组合
     """
     
     def __init__(self, model_path: str = None, use_trigram: bool = True):
-        self.char_freq = Counter()       # 单字频率
-        self.bigram_freq = Counter()     # 双字频率
-        self.trigram_freq = Counter()    # 三字频率（新增）
+        self.char_freq = Counter()       # 单字频率（兼容）
+        self.bigram_freq = Counter()     # 词语级 bigram: (w1, w2)
+        self.trigram_freq = Counter()    # 词语级 trigram: (w1, w2, w3)
+        self.word_freq = Counter()       # 词频
         self.total_chars = 0
+        self.use_word_level = False      # 标记是否使用词语级
         self.total_bigrams = 0
         self.total_trigrams = 0
         self.use_trigram = use_trigram   # 是否启用trigram
         
-        # 罕见字阈值
-        self.rare_threshold = 5
-        # Trigram阈值（更严格，因为数据更稀疏）
-        self.trigram_threshold = 3
+        # 罕见词阈值（针对360万报告调整）
+        # 对于大数据集，阈值应该更高，避免正常低频词被误判
+        self.rare_threshold = 50      # bigram出现<50次视为罕见（原为5）
+        self.trigram_threshold = 20   # trigram出现<20次视为罕见（原为3）
         # 异常分数阈值
         self.score_threshold = 0.7
         
@@ -81,33 +96,54 @@ class CharacterAnomalyDetector:
             self.load(model_path)
     
     def train(self, texts: List[str]):
-        """从文本列表训练"""
-        print(f"训练字符级异常检测器... (trigram={'启用' if self.use_trigram else '禁用'})")
+        """训练词语级 n-gram 模型"""
+        print(f"训练词语级异常检测器... (trigram={'启用' if self.use_trigram else '禁用'})")
+        import re
+        
         for text in texts:
-            # 只保留中文字符
-            chars = [c for c in text if '\u4e00' <= c <= '\u9fff']
-            self.char_freq.update(chars)
-            self.total_chars += len(chars)
+            # 按标点分割句子
+            segments = re.split(r'[。！？；，、：:；\.\!\?\,\n\r]+', text)
             
-            # 双字组合
-            for i in range(len(chars) - 1):
-                bigram = chars[i] + chars[i+1]
-                self.bigram_freq[bigram] += 1
-                self.total_bigrams += 1
-            
-            # 三字组合（trigram）- 对医学文本更可靠
-            if self.use_trigram:
-                for i in range(len(chars) - 2):
-                    trigram = chars[i] + chars[i+1] + chars[i+2]
-                    self.trigram_freq[trigram] += 1
-                    self.total_trigrams += 1
+            for segment in segments:
+                segment = segment.strip()
+                if not segment:
+                    continue
+                
+                # jieba分词
+                words = list(jieba.cut(segment))
+                # 过滤空词和纯符号
+                words = [w for w in words if w.strip() and not all(c in ' \n\r\t' for c in w)]
+                
+                if len(words) < 2:
+                    continue
+                
+                # 统计词频
+                self.word_freq.update(words)
+                
+                # 词语级 bigram (w1, w2)
+                for i in range(len(words) - 1):
+                    bigram = (words[i], words[i+1])
+                    self.bigram_freq[bigram] += 1
+                    self.total_bigrams += 1
+                
+                # 词语级 trigram (w1, w2, w3)
+                if self.use_trigram and len(words) >= 3:
+                    for i in range(len(words) - 2):
+                        trigram = (words[i], words[i+1], words[i+2])
+                        self.trigram_freq[trigram] += 1
+                        self.total_trigrams += 1
+        
+        self.use_word_level = True
+        print(f"训练完成: {len(self.word_freq)} 词, {len(self.bigram_freq)} bigrams")
+        if self.use_trigram:
+            print(f"  - {len(self.trigram_freq)} trigrams")
     
     def save(self, path: str):
-        """保存模型"""
+        """保存词语级模型"""
         data = {
-            'char_freq': dict(self.char_freq),
+            'use_word_level': True,
+            'word_freq': dict(self.word_freq),
             'bigram_freq': dict(self.bigram_freq),
-            'total_chars': self.total_chars,
             'total_bigrams': self.total_bigrams,
             'use_trigram': self.use_trigram,
         }
@@ -119,24 +155,193 @@ class CharacterAnomalyDetector:
             pickle.dump(data, f)
     
     def load(self, path: str):
-        """加载模型"""
+        """加载模型 - 支持词语级新格式"""
         with open(path, 'rb') as f:
             data = pickle.load(f)
-            self.char_freq = Counter(data['char_freq'])
-            self.bigram_freq = Counter(data['bigram_freq'])
-            self.total_chars = data['total_chars']
-            self.total_bigrams = data['total_bigrams']
-            self.use_trigram = data.get('use_trigram', False)
             
-            if self.use_trigram and 'trigram_freq' in data:
-                self.trigram_freq = Counter(data['trigram_freq'])
-                self.total_trigrams = data.get('total_trigrams', 0)
-                print(f"加载Trigram模型: {len(self.trigram_freq)} 个唯一trigram")
+            # 检查是否是词语级模型
+            self.use_word_level = data.get('use_word_level', False)
+            
+            if self.use_word_level:
+                # 词语级模型
+                self.word_freq = Counter(data.get('word_freq', {}))
+                # bigram/trigram 是 tuple -> count 的映射
+                self.bigram_freq = Counter({
+                    tuple(k) if isinstance(k, list) else k: v 
+                    for k, v in data.get('bigram_freq', {}).items()
+                })
+                if self.use_trigram:
+                    self.trigram_freq = Counter({
+                        tuple(k) if isinstance(k, list) else k: v
+                        for k, v in data.get('trigram_freq', {}).items()
+                    })
+                print(f"加载词语级模型: {len(self.word_freq)} 词, {len(self.bigram_freq)} bigrams")
+                if self.use_trigram:
+                    print(f"  - {len(self.trigram_freq)} trigrams")
+            else:
+                # 字符级模型（兼容旧格式）
+                self.char_freq = Counter(data['char_freq'])
+                self.bigram_freq = Counter(data['bigram_freq'])
+                self.total_chars = data['total_chars']
+                self.total_bigrams = data['total_bigrams']
+                self.use_trigram = data.get('use_trigram', False)
+                
+                if self.use_trigram and 'trigram_freq' in data:
+                    self.trigram_freq = Counter(data['trigram_freq'])
+                    self.total_trigrams = data.get('total_trigrams', 0)
+                    print(f"加载字符级Trigram模型: {len(self.trigram_freq)} 个trigram")
     
     def detect(self, text: str) -> List[SuspiciousFragment]:
-        """检测字符级异常（支持Trigram）"""
+        """
+        检测异常 - 词语级 n-gram 版本
+        
+        根本改进：
+        - 使用 jieba 分词
+        - 检测词语级 trigram: (w1, w2, w3)
+        - 不会出现跨词边界的组合如 "房稍缩"
+        """
+        import re
+        
         fragments = []
-        chars = [c for c in text if '\u4e00' <= c <= '\u9fff']
+        
+        # 按标点分割
+        segments = re.split(r'([。！？；，、：:；\.\!\?\,\n\r]+)', text)
+        
+        full_segments = []
+        current = ''
+        for part in segments:
+            current += part
+            if re.match(r'[。！？；，、：:；\.\!\?\,\n\r]+', part):
+                full_segments.append(current)
+                current = ''
+        if current:
+            full_segments.append(current)
+        
+        text_offset = 0
+        
+        for seg in full_segments:
+            if len(seg.strip()) > 0:
+                if self.use_word_level:
+                    # 词语级检测（新模型）
+                    sent_fragments = self._detect_words_in_sentence(seg, text_offset)
+                else:
+                    # 字符级检测（兼容旧模型）
+                    sent_fragments = self._detect_in_sentence(seg, text_offset)
+                fragments.extend(sent_fragments)
+            text_offset += len(seg)
+        
+        return fragments
+    
+    def _is_valid_word(self, word: str) -> bool:
+        """检查词是否有效（包含至少一个中文字符）"""
+        if not word or not word.strip():
+            return False
+        # 必须包含中文字符
+        has_chinese = any('\u4e00' <= c <= '\u9fff' for c in word)
+        return has_chinese
+    
+    def _detect_words_in_sentence(self, text: str, text_offset: int = 0) -> List[SuspiciousFragment]:
+        """
+        词语级检测 - 根本解决跨边界问题
+        
+        对于 "左心房稍缩小"：
+        - jieba 分词: ['左心房', '稍', '缩小']
+        - 检测 trigram: ('左心房', '稍', '缩小') 的频率
+        - 不会出现 '房稍缩'，因为这需要跨越词边界
+        """
+        fragments = []
+        
+        # 分词
+        words = list(jieba.cut(text))
+        
+        # 过滤：只保留包含中文字符的词，记录位置
+        word_info = []  # [(word, start, end), ...]
+        current_pos = 0
+        for word in words:
+            word_stripped = word.strip()
+            if not word_stripped:
+                current_pos += len(word)
+                continue
+            
+            # 过滤：必须包含中文字符（排除纯标点、纯英文、纯数字）
+            if not self._is_valid_word(word_stripped):
+                current_pos += len(word)
+                continue
+            
+            # 找到词在原文中的位置
+            start = text.find(word_stripped, current_pos)
+            if start == -1:
+                start = current_pos
+            end = start + len(word_stripped)
+            
+            word_info.append((word_stripped, text_offset + start, text_offset + end))
+            current_pos = end
+        
+        if len(word_info) < 2:
+            return fragments
+        
+        # 词语级 Bigram 检测
+        for i in range(len(word_info) - 1):
+            w1, s1, e1 = word_info[i]
+            w2, s2, e2 = word_info[i + 1]
+            
+            bigram = (w1, w2)
+            count = self.bigram_freq.get(bigram, 0)
+            
+            if count < self.rare_threshold:
+                score = 0.6 + 0.3 * (1 - count / self.rare_threshold)
+                
+                # 合并两个词作为显示文本
+                display_text = w1 + w2
+                
+                fragments.append(SuspiciousFragment(
+                    text=display_text,
+                    position=(s1, e2),
+                    strategy='word_bigram_rarity',
+                    score=min(score, 0.9),
+                    context=display_text,
+                    reason=f"罕见词语组合: '{w1}+{w2}' 出现{count}次"
+                ))
+        
+        # 词语级 Trigram 检测
+        if self.use_trigram and len(word_info) >= 3:
+            for i in range(len(word_info) - 2):
+                w1, s1, e1 = word_info[i]
+                w2, s2, e2 = word_info[i + 1]
+                w3, s3, e3 = word_info[i + 2]
+                
+                trigram = (w1, w2, w3)
+                count = self.trigram_freq.get(trigram, 0)
+                
+                if count < self.trigram_threshold:
+                    score = 0.7 + 0.25 * (1 - count / self.trigram_threshold)
+                    
+                    display_text = w1 + w2 + w3
+                    
+                    fragments.append(SuspiciousFragment(
+                        text=display_text,
+                        position=(s1, e3),
+                        strategy='word_trigram_rarity',
+                        score=min(score, 0.95),
+                        context=display_text,
+                        reason=f"罕见三词组合: '{w1}+{w2}+{w3}' 出现{count}次"
+                    ))
+        
+        return fragments
+    
+    def _detect_in_sentence(self, text: str, text_offset: int = 0) -> List[SuspiciousFragment]:
+        """字符级检测（兼容旧模型）"""
+        fragments = []
+        
+        char_positions = []
+        chars = []
+        for idx, c in enumerate(text):
+            if '\u4e00' <= c <= '\u9fff':
+                char_positions.append(text_offset + idx)
+                chars.append(c)
+        
+        if not chars:
+            return fragments
         
         # 优先检测trigram（最可靠）
         if self.use_trigram and len(chars) >= 3:
@@ -148,13 +353,20 @@ class CharacterAnomalyDetector:
                     # Trigram异常分数 - 更严格的阈值
                     score = 0.7 + 0.25 * (1 - trigram_count / self.trigram_threshold)
                     
-                    start = max(0, i - 2)
-                    end = min(len(chars), i + 5)
-                    context = ''.join(chars[start:end])
+                    # 上下文窗口（中文字符索引）
+                    ctx_start = max(0, i - 2)
+                    ctx_end = min(len(chars), i + 5)
+                    context = ''.join(chars[ctx_start:ctx_end])
+                    
+                    # 计算原文本中的绝对位置
+                    # 注意：char_positions记录每个中文字符的起始位置
+                    # 片段结束位置应该是最后一个中文字符的下一个字符位置
+                    abs_start = char_positions[i]
+                    abs_end = char_positions[i + 2] + 1
                     
                     fragments.append(SuspiciousFragment(
                         text=trigram,
-                        position=(i, i+3),
+                        position=(abs_start, abs_end),
                         strategy='trigram_rarity',
                         score=min(score, 0.95),
                         context=context,
@@ -164,9 +376,14 @@ class CharacterAnomalyDetector:
         # 检测bigram（在没有trigram或trigram不明确时）
         if len(chars) >= 2:
             for i in range(len(chars) - 1):
+                # 计算该bigram在原文本中的位置
+                bigram_abs_start = char_positions[i]
+                bigram_abs_end = char_positions[i + 1] + 1
+                
                 # 跳过已被trigram覆盖的区域
                 if self.use_trigram and any(
-                    f.position[0] <= i < f.position[1] 
+                    f.position[0] <= bigram_abs_start < f.position[1] or
+                    f.position[0] < bigram_abs_end <= f.position[1]
                     for f in fragments if f.strategy == 'trigram_rarity'
                 ):
                     continue
@@ -177,13 +394,13 @@ class CharacterAnomalyDetector:
                 if bigram_count < self.rare_threshold:
                     score = 0.6 + 0.3 * (1 - bigram_count / self.rare_threshold)
                     
-                    start = max(0, i - 2)
-                    end = min(len(chars), i + 4)
-                    context = ''.join(chars[start:end])
+                    ctx_start = max(0, i - 2)
+                    ctx_end = min(len(chars), i + 4)
+                    context = ''.join(chars[ctx_start:ctx_end])
                     
                     fragments.append(SuspiciousFragment(
                         text=bigram,
-                        position=(i, i+2),
+                        position=(bigram_abs_start, bigram_abs_end),
                         strategy='bigram_rarity',
                         score=min(score, 0.9),
                         context=context,
@@ -192,8 +409,11 @@ class CharacterAnomalyDetector:
         
         # 单字罕见度（最低优先级）
         for i, char in enumerate(chars):
+            char_abs_pos = char_positions[i]
+            char_abs_end = char_abs_pos + 1
+            
             # 跳过已被覆盖的区域
-            if any(f.position[0] <= i < f.position[1] for f in fragments):
+            if any(f.position[0] <= char_abs_pos < f.position[1] for f in fragments):
                 continue
             
             char_count = self.char_freq.get(char, 0)
@@ -201,13 +421,13 @@ class CharacterAnomalyDetector:
             if char_count < self.rare_threshold:
                 score = 0.5 + 0.2 * (1 - char_count / self.rare_threshold)
                 
-                start = max(0, i - 3)
-                end = min(len(chars), i + 4)
-                context = ''.join(chars[start:end])
+                ctx_start = max(0, i - 3)
+                ctx_end = min(len(chars), i + 4)
+                context = ''.join(chars[ctx_start:ctx_end])
                 
                 fragments.append(SuspiciousFragment(
                     text=char,
-                    position=(i, i+1),
+                    position=(char_abs_pos, char_abs_end),
                     strategy='char_rarity',
                     score=min(score, 0.8),
                     context=context,
@@ -253,6 +473,18 @@ class ContextEntropyDetector:
                 if i < len(chars) - 1:
                     self.right_context[char][chars[i+1]] += 1
     
+    def load(self, path: str):
+        """加载模型"""
+        import pickle
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+            # 将普通dict转换回Counter
+            self.left_context = defaultdict(Counter, 
+                {k: Counter(v) for k, v in data.get('left_context', {}).items()})
+            self.right_context = defaultdict(Counter, 
+                {k: Counter(v) for k, v in data.get('right_context', {}).items()})
+        print(f"加载熵模型: {len(self.left_context)} 个字符的上下文")
+    
     def _calculate_entropy(self, counter: Counter) -> float:
         """计算熵"""
         total = sum(counter.values())
@@ -268,7 +500,14 @@ class ContextEntropyDetector:
     def detect(self, text: str) -> List[SuspiciousFragment]:
         """检测熵异常"""
         fragments = []
-        chars = [c for c in text if '\u4e00' <= c <= '\u9fff']
+        
+        # 建立中文字符在原文本中的位置映射
+        char_positions = []
+        chars = []
+        for idx, c in enumerate(text):
+            if '\u4e00' <= c <= '\u9fff':
+                char_positions.append(idx)
+                chars.append(c)
         
         for i, char in enumerate(chars):
             left_entropy = self._calculate_entropy(self.left_context[char])
@@ -297,15 +536,18 @@ class ContextEntropyDetector:
                     context_seen = False
                 
                 if not context_seen:
-                    start = max(0, i - 2)
-                    end = min(len(chars), i + 3)
-                    context = ''.join(chars[start:end])
+                    ctx_start = max(0, i - 2)
+                    ctx_end = min(len(chars), i + 3)
+                    context = ''.join(chars[ctx_start:ctx_end])
                     
                     score = 0.5 + 0.3 * min(avg_entropy / 5, 1)
                     
+                    # 计算原文本中的绝对位置
+                    abs_pos = char_positions[i]
+                    
                     fragments.append(SuspiciousFragment(
                         text=char,
-                        position=(i, i+1),
+                        position=(abs_pos, abs_pos + 1),
                         strategy='entropy_anomaly',
                         score=min(score, 0.9),
                         context=context,
@@ -435,6 +677,8 @@ class FastRecoverDetector:
         Returns:
             可疑片段列表（已排序，高分在前）
         """
+        import re
+        
         if not text or len(text) < 3:
             return []
         
@@ -458,8 +702,32 @@ class FastRecoverDetector:
         # 过滤低分片段
         all_fragments = [f for f in all_fragments if f.score >= min_score]
         
+        # 过滤无意义片段
+        filtered_fragments = []
+        for f in all_fragments:
+            # 1. 跳过纯空格
+            if not f.text or not f.text.strip():
+                continue
+            
+            # 2. 跳过单字片段（除非是模式异常）
+            if len(f.text.strip()) == 1 and f.strategy not in ['pattern', 'length']:
+                continue
+            
+            # 3. 跳过纯英文/数字片段（>90%）
+            en_num_count = sum(1 for c in f.text if c.isascii() and (c.isalpha() or c.isdigit()))
+            if len(f.text) > 0 and en_num_count / len(f.text) > 0.9:
+                continue
+            
+            # 4. 跳过纯符号
+            has_chinese = bool(re.search(r'[\u4e00-\u9fff]', f.text))
+            has_alnum = any(c.isalnum() for c in f.text)
+            if not has_chinese and not has_alnum:
+                continue
+            
+            filtered_fragments.append(f)
+        
         # 合并重叠片段
-        merged = self._merge_fragments(all_fragments)
+        merged = self._merge_fragments(filtered_fragments)
         
         # 按分数排序
         merged.sort(key=lambda x: x.score, reverse=True)

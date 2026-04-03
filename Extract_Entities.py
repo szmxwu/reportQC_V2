@@ -823,6 +823,6 @@ if __name__ == '__main__':
     # output_file = BASE_DIR / 'processed_copus' / 'processed_report_data'
     # (result_df[:int(len(result_df)/2)]).to_excel(str(output_file) + "1.xlsx", index=False)
     # (result_df[int(len(result_df)/2):]).to_excel(str(output_file) + "2.xlsx", index=False)
-    test=text_extrac_process(" 门静脉左支可见一异常区域,大小强化约1CM。形态不规则,边界不清",modality="CT")
+    test=text_extrac_process(" 左下肺前内基底段不规则团片影，性质待定，建议增强",modality="CT")
     pprint(test)
 

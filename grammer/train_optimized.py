@@ -35,7 +35,7 @@ from functools import partial
 import pickle
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import warnings
 
 import pandas as pd
@@ -141,8 +141,13 @@ def extract_chinese_chars_fast(text):
     return chars
 
 
+# 强制导入jieba并加载词典
+import jieba
+jieba.load_userdict("config/user_dic_expand.txt")
+print("已加载jieba自定义词典")
+
 class OptimizedTextProcessor:
-    """优化的文本处理器"""
+    """优化的文本处理器 - 词语级 n-gram"""
     
     def __init__(self, use_numba=True, use_gpu=False):
         self.use_numba = use_numba and NUMBA_AVAILABLE
@@ -150,16 +155,23 @@ class OptimizedTextProcessor:
         
     def process_texts_batch(self, texts, use_trigram=True):
         """
-        批量处理文本（优化版本）
+        批量处理文本 - 词语级 n-gram 版本
         
-        策略：
-        1. 使用NumPy向量化处理
-        2. 批量统计减少Python循环开销
-        3. 预分配内存
+        根本改进：
+        1. 先用jieba分词
+        2. 统计词语级 bigram/trigram（而非字符级）
+        3. 这样"房稍缩"这种跨词边界的组合不会被统计到
+        
+        例如："左心房稍缩小" -> ['左心房', '稍', '缩小']
+        - 词语级 trigram: ('左心房', '稍', '缩小') - 有效
+        - 不会出现: '房稍缩' - 因为这跨越了词边界
         """
+        import re
+        
         char_freq = Counter()
-        bigram_freq = Counter()
-        trigram_freq = Counter() if use_trigram else None
+        word_freq = Counter()  # 词频统计
+        bigram_freq = Counter()  # 词语级 bigram
+        trigram_freq = Counter() if use_trigram else None  # 词语级 trigram
         left_context = defaultdict(Counter)
         right_context = defaultdict(Counter)
         
@@ -167,52 +179,68 @@ class OptimizedTextProcessor:
             if not isinstance(text, str) or not text:
                 continue
             
-            # 快速提取中文字符
-            if self.use_numba:
-                # Numba加速路径
-                try:
-                    char_codes = extract_chinese_chars_numba(text.encode('utf-8'))
-                    chars = [chr(c) for c in char_codes]
-                except:
-                    chars = extract_chinese_chars_fast(text)
-            else:
-                # 纯Python回退
-                chars = [c for c in text if '\u4e00' <= c <= '\u9fff']
+            # 按标点分割文本
+            segments = re.split(r'[。！？；，、：:；\.\!\?\,\n\r]+', text)
             
-            if not chars:
-                continue
-            
-            n = len(chars)
-            
-            # 单字统计
-            char_freq.update(chars)
-            
-            # Bigram统计（批量）
-            if n >= 2:
-                bigrams = [chars[i] + chars[i+1] for i in range(n-1)]
-                bigram_freq.update(bigrams)
-            
-            # Trigram统计（批量）
-            if use_trigram and n >= 3:
-                trigrams = [chars[i] + chars[i+1] + chars[i+2] for i in range(n-2)]
-                trigram_freq.update(trigrams)
-            
-            # 上下文统计
-            for i, char in enumerate(chars):
-                if char not in left_context:
-                    left_context[char] = Counter()
-                    right_context[char] = Counter()
+            for segment in segments:
+                segment = segment.strip()
+                if not segment:
+                    continue
                 
-                if i > 0:
-                    left_context[char][chars[i-1]] += 1
-                if i < n - 1:
-                    right_context[char][chars[i+1]] += 1
+                # 提取中文字符用于字符级统计
+                chars = [c for c in segment if '\u4e00' <= c <= '\u9fff']
+                if chars:
+                    char_freq.update(chars)
+                
+                # ===== 词语级 n-gram 统计 =====
+                # 使用jieba分词
+                words = list(jieba.cut(segment))
+                # 过滤：只保留包含中文字符的词（排除纯标点、纯英文、纯数字）
+                def _is_valid_word(w):
+                    if not w or not w.strip():
+                        return False
+                    return any('\u4e00' <= c <= '\u9fff' for c in w)
+                words = [w for w in words if _is_valid_word(w)]
+                
+                if len(words) < 2:
+                    continue
+                
+                # 词频统计
+                word_freq.update(words)
+                
+                n = len(words)
+                
+                # 词语级 Bigram: (w1, w2)
+                if n >= 2:
+                    for i in range(n - 1):
+                        bigram = (words[i], words[i+1])
+                        bigram_freq[bigram] += 1
+                
+                # 词语级 Trigram: (w1, w2, w3)
+                if use_trigram and n >= 3:
+                    for i in range(n - 2):
+                        trigram = (words[i], words[i+1], words[i+2])
+                        trigram_freq[trigram] += 1
+                
+                # 字符级上下文统计（保持兼容）
+                if chars:
+                    for i, char in enumerate(chars):
+                        if char not in left_context:
+                            left_context[char] = Counter()
+                            right_context[char] = Counter()
+                        
+                        if i > 0:
+                            left_context[char][chars[i-1]] += 1
+                        if i < len(chars) - 1:
+                            right_context[char][chars[i+1]] += 1
         
         result = {
             'char_freq': char_freq,
+            'word_freq': word_freq,
             'bigram_freq': bigram_freq,
             'left_context': left_context,
             'right_context': right_context,
+            'use_word_level': True,  # 标记使用词语级
         }
         
         if use_trigram:
@@ -242,6 +270,59 @@ def read_excel_optimized(file_path, columns=None, dtype=None):
         return pd.DataFrame()
 
 
+def clean_text_for_training(text: str) -> str:
+    """
+    清洗训练文本
+    
+    1. 替换连续空格为单个空格
+    2. 移除控制字符
+    3. 保留中文字符、常见标点和必要英文（如cm, mm）
+    """
+    import re
+    
+    if not text or not text.strip():
+        return ''
+    
+    # 替换连续空白字符为单个空格
+    text = re.sub(r'\s+', ' ', text)
+    
+    # 移除控制字符（除换行、制表符外）
+    text = ''.join(c for c in text if c >= ' ' or c in '\n\t')
+    
+    return text.strip()
+
+
+def is_valid_training_text(text: str) -> bool:
+    """
+    检查文本是否适合训练
+    
+    过滤：
+    1. 纯空格
+    2. 主要由英文/数字组成（>80%）
+    3. 太短（<3个中文字符）
+    4. 纯符号
+    """
+    import re
+    
+    if not text or len(text.strip()) < 3:
+        return False
+    
+    # 统计中文字符
+    chinese_chars = re.findall(r'[\u4e00-\u9fff]', text)
+    if len(chinese_chars) < 3:
+        return False
+    
+    # 统计英文和数字
+    en_num_chars = sum(1 for c in text if c.isascii() and (c.isalpha() or c.isdigit()))
+    total_chars = len(text)
+    
+    # 如果英文/数字占比超过80%，跳过
+    if en_num_chars / total_chars > 0.8:
+        return False
+    
+    return True
+
+
 def load_texts_parallel(data_dir: str, num_workers=4, max_texts: int = None):
     """
     并行加载文本（多线程IO + 多进程处理）
@@ -249,6 +330,7 @@ def load_texts_parallel(data_dir: str, num_workers=4, max_texts: int = None):
     针对32G内存优化：
     - 大缓冲区减少IO次数
     - 预读取所有文件到内存
+    - 清洗数据：过滤纯空格、英文片段
     """
     data_path = Path(data_dir).expanduser()
     pattern = str(data_path / "all_data_match*.xlsx")
@@ -261,6 +343,7 @@ def load_texts_parallel(data_dir: str, num_workers=4, max_texts: int = None):
     print(f"使用 {num_workers} 个线程并行读取")
     
     all_texts = []
+    skipped_count = 0
     
     # 多线程读取Excel
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
@@ -278,11 +361,18 @@ def load_texts_parallel(data_dir: str, num_workers=4, max_texts: int = None):
                 for col in ['描述', '结论']:
                     if col in row and pd.notna(row[col]):
                         text = str(row[col]).strip()
-                        text = text.replace('_x000D_', ' ').replace('\r', ' ')
-                        parts.append(text)
+                        # 清洗文本
+                        text = clean_text_for_training(text)
+                        if text:
+                            parts.append(text)
                 
                 if parts:
-                    all_texts.append(' '.join(parts))
+                    combined_text = ' '.join(parts)
+                    # 验证文本是否适合训练
+                    if is_valid_training_text(combined_text):
+                        all_texts.append(combined_text)
+                    else:
+                        skipped_count += 1
                 
                 if max_texts and len(all_texts) >= max_texts:
                     break
@@ -291,6 +381,7 @@ def load_texts_parallel(data_dir: str, num_workers=4, max_texts: int = None):
                 all_texts = all_texts[:max_texts]
                 break
     
+    print(f"文本清洗: 跳过 {skipped_count} 条无效文本（纯空格/英文/过短）")
     return all_texts
 
 
@@ -307,17 +398,24 @@ def process_chunk_optimized(args):
 
 
 def merge_results_optimized(results, use_trigram=True):
-    """优化的结果合并"""
+    """优化的结果合并 - 支持词语级"""
     final_char = Counter()
+    final_word = Counter()
     final_bigram = Counter()
     final_trigram = Counter() if use_trigram else None
     final_left = {}
     final_right = {}
     
+    # 检查是否是词语级模型
+    use_word_level = results[0].get('use_word_level', False) if results else False
+    
     print("合并统计结果...")
     for result in tqdm(results, desc="合并"):
-        final_char.update(result['char_freq'])
+        final_char.update(result.get('char_freq', {}))
         final_bigram.update(result['bigram_freq'])
+        
+        if use_word_level:
+            final_word.update(result.get('word_freq', {}))
         
         if use_trigram and 'trigram_freq' in result:
             final_trigram.update(result['trigram_freq'])
@@ -338,7 +436,11 @@ def merge_results_optimized(results, use_trigram=True):
         'bigram_freq': final_bigram,
         'left_context': final_left,
         'right_context': final_right,
+        'use_word_level': use_word_level,
     }
+    
+    if use_word_level:
+        result['word_freq'] = final_word
     
     if use_trigram:
         result['trigram_freq'] = final_trigram
@@ -348,31 +450,43 @@ def merge_results_optimized(results, use_trigram=True):
 
 def save_model_optimized(result, output_dir, use_trigram=True, protocol=4):
     """
-    优化的模型保存
-    
-    使用最高效的pickle协议（protocol=4或5）
+    优化的模型保存 - 支持词语级
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # 检查是否是词语级模型
+    use_word_level = result.get('use_word_level', False)
     
     # 转换为普通dict
     left_ctx = {k: dict(v) for k, v in result['left_context'].items()}
     right_ctx = {k: dict(v) for k, v in result['right_context'].items()}
     
-    # 字符模型
-    char_model = {
-        'char_freq': dict(result['char_freq']),
-        'bigram_freq': dict(result['bigram_freq']),
-        'total_chars': sum(result['char_freq'].values()),
-        'total_bigrams': sum(result['bigram_freq'].values()),
-        'use_trigram': use_trigram,
-        'optimized': True,
-    }
+    if use_word_level:
+        # 词语级模型
+        char_model = {
+            'use_word_level': True,
+            'word_freq': dict(result['word_freq']),
+            'bigram_freq': dict(result['bigram_freq']),
+            'use_trigram': use_trigram,
+            'optimized': True,
+        }
+        if use_trigram and 'trigram_freq' in result:
+            char_model['trigram_freq'] = dict(result['trigram_freq'])
+    else:
+        # 字符级模型（兼容旧格式）
+        char_model = {
+            'char_freq': dict(result['char_freq']),
+            'bigram_freq': dict(result['bigram_freq']),
+            'total_chars': sum(result['char_freq'].values()),
+            'total_bigrams': sum(result['bigram_freq'].values()),
+            'use_trigram': use_trigram,
+            'optimized': True,
+        }
+        if use_trigram and 'trigram_freq' in result:
+            char_model['trigram_freq'] = dict(result['trigram_freq'])
+            char_model['total_trigrams'] = sum(result['trigram_freq'].values())
     
-    if use_trigram and 'trigram_freq' in result:
-        char_model['trigram_freq'] = dict(result['trigram_freq'])
-        char_model['total_trigrams'] = sum(result['trigram_freq'].values())
-    
-    # 使用最高效的协议保存
+    # 保存模型
     with open(f"{output_dir}/char_anomaly.pkl", 'wb') as f:
         pickle.dump(char_model, f, protocol=protocol)
     
@@ -386,14 +500,20 @@ def save_model_optimized(result, output_dir, use_trigram=True, protocol=4):
     
     # 统计信息
     stats = {
-        'unique_chars': len(result['char_freq']),
+        'use_word_level': use_word_level,
         'unique_bigrams': len(result['bigram_freq']),
-        'total_chars': sum(result['char_freq'].values()),
-        'top_chars': result['char_freq'].most_common(20),
-        'top_bigrams': result['bigram_freq'].most_common(20),
         'use_trigram': use_trigram,
         'optimized': True,
     }
+    
+    if use_word_level:
+        stats['unique_words'] = len(result['word_freq'])
+        stats['top_words'] = result['word_freq'].most_common(20)
+        stats['top_bigrams'] = result['bigram_freq'].most_common(20)
+    else:
+        stats['unique_chars'] = len(result['char_freq'])
+        stats['total_chars'] = sum(result['char_freq'].values())
+        stats['top_chars'] = result['char_freq'].most_common(20)
     
     if use_trigram and 'trigram_freq' in result:
         stats['unique_trigrams'] = len(result['trigram_freq'])
@@ -405,11 +525,15 @@ def save_model_optimized(result, output_dir, use_trigram=True, protocol=4):
         json.dump(stats, f, ensure_ascii=False, indent=2)
     
     print(f"\n模型已保存到: {output_dir}")
-    print(f"  - 唯一字符: {stats['unique_chars']}")
-    print(f"  - 唯一bigram: {stats['unique_bigrams']}")
+    if use_word_level:
+        print(f"  - 词语级模型")
+        print(f"  - 唯一词: {stats.get('unique_words', 0)}")
+    else:
+        print(f"  - 字符级模型")
+        print(f"  - 唯一字符: {stats.get('unique_chars', 0)}")
+    print(f"  - 唯一bigrams: {stats['unique_bigrams']}")
     if use_trigram and 'unique_trigrams' in stats:
-        print(f"  - 唯一trigram: {stats['unique_trigrams']}")
-    print(f"  - 总字符数: {stats['total_chars']:,}")
+        print(f"  - 唯一trigrams: {stats['unique_trigrams']}")
     
     # 计算压缩率
     import os
@@ -506,15 +630,16 @@ def main():
     
     detector = LayeredGrammarDetector(model_dir=args.output, use_trigram=args.use_trigram)
     test_cases = [
-        "双肺纹理增粗",
-        "双肺文里增粗",
-        "胸部CT正常",
+        ("双肺纹理增粗", "正常"),
+        ("双肺文里增粗", "有错"),
+        ("胸部CT正常", "正常"),
     ]
     
-    for text in test_cases:
+    for text, expected in test_cases:
         suspicious = detector.fast_detect(text)
-        trigrams = [f for f in suspicious if f.strategy == 'trigram_rarity']
-        print(f"  '{text}': {len(suspicious)}个可疑（{len(trigrams)}个trigram）")
+        # 统计各策略数量（包含词语级和字符级）
+        word_level = [f for f in suspicious if 'word_' in f.strategy]
+        print(f"  '{text}' [{expected}]: {len(suspicious)}个可疑（{len(word_level)}个词语级）")
     
     print("\n" + "=" * 70)
     print("训练完成！")

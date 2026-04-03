@@ -7,7 +7,7 @@ import json
 import requests
 from typing import List, Dict, Optional, Tuple
 from dotenv import load_dotenv
-
+from json_repair import repair_json
 # 加载环境变量
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 if os.path.exists(dotenv_path):
@@ -296,6 +296,7 @@ class LLMValidator:
         """解析LLM的JSON响应"""
         try:
             # 尝试直接解析
+            response=repair_json(response)
             return json.loads(response)
         except json.JSONDecodeError:
             # 尝试从文本中提取JSON

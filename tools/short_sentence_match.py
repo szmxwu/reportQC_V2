@@ -50,13 +50,21 @@ def find_best_matching_clause_for_single(short_clause, original_sentence):
         tuple: (最匹配的子句, 相似度分数, 位置索引)
     """
     
-    # 第0层：完全匹配检查
+    # 第1层：切割子句（先切分，用于完全匹配检查）
+    original_clauses = split_into_clauses(original_sentence)
+    
+    # 第0层：完全匹配检查 - 返回匹配子句的起始位置而非字符串索引
     if short_clause in original_sentence:
         start_idx = original_sentence.index(short_clause)
+        # 找到包含这个起始位置的子句，返回该子句的起始位置
+        for clause, position in original_clauses:
+            clause_end = position + len(clause)
+            if position <= start_idx < clause_end:
+                # 返回匹配的子句内容（而非short_clause）和子句起始位置
+                return (clause, 1.0, position)
+        # 如果找不到对应的子句，回退到字符串索引
         return (short_clause, 1.0, start_idx)
     
-    # 第1层：切割子句
-    original_clauses = split_into_clauses(original_sentence)
     
     # 第2层：快速筛选 + 相似度计算
     short_chars = set(short_clause)

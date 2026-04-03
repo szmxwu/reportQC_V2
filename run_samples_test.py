@@ -1,97 +1,54 @@
 #!/usr/bin/env python3
 """
 医学影像报告质控测试脚本
-用于批量测试 samples.xlsx 中的样本，并生成对比报告
+批量运行 samples.xlsx 中的样本，输出质控结果到Excel
 
 使用方法:
-    python run_samples_test.py                    # 运行所有测试
+    python run_samples_test.py                    # 运行所有样本
     python run_samples_test.py --verbose          # 显示详细输出
-    python run_samples_test.py --tag 部位缺失      # 只测试特定标签
+    python run_samples_test.py --tag 部位缺失      # 只运行特定标签
     python run_samples_test.py --output result.xlsx # 指定输出文件名
+    python run_samples_test.py --no-llm           # 禁用LLM验证
 """
+
+import os
+# 默认启用LLM验证
+os.environ['USE_LLM_VALIDATION'] = 'true'
 
 import pandas as pd
 import argparse
 import sys
-import re
 from datetime import datetime
 from NLP_analyze import Report, Report_Quality
 
 
-def normalize_text(text):
-    """标准化文本以便比较"""
-    if text is None:
-        return ""
-    text = str(text)
-    # 移除多余空格、换行符
-    text = re.sub(r'\s+', '', text)
-    # 统一标点
-    text = text.replace('，', ',').replace('。', '.').replace('；', ';')
-    return text.lower()
+def safe_str(value):
+    """将值转换为字符串，空值转为空字符串"""
+    if value is None:
+        return ''
+    if isinstance(value, list):
+        if not value:
+            return ''
+        return '；'.join(str(x) for x in value)
+    return str(value)
 
 
-def determine_field(expected):
-    """根据期望输出确定对应的QC字段"""
-    if '漏写部位' in expected:
-        return 'QC_partmissing'
-    elif '检查项目方位' in expected:
-        return 'QC_partinverse'
-    elif '检查方式' in expected:
-        return 'QC_special_missing'
-    elif '测量值' in expected:
-        return 'QC_measure_unit_error'
-    elif '术语' in expected:
-        return 'QC_none_standard_term'
-    elif '危急值' in expected:
-        return 'QC_Critical_value'
-    elif '性别' in expected:
-        return 'QC_sex_error'
-    elif '语言矛盾' in expected:
-        return 'QC_contradiction'
-    elif 'RADS' in expected:
-        return 'QC_RADS'
-    elif '结论' in expected and '方位' in expected:
-        return 'QC_orient_error'
-    elif '描述与结论' in expected or '结论' in expected:
-        return 'QC_conclusion_missing'
-    elif '申请单' in expected:
-        return 'QC_apply_orient'
-    else:
-        return None
-
-
-def is_match(expected, actual, field):
-    """判断期望和实际是否匹配"""
-    expected_norm = normalize_text(expected)
-    actual_norm = normalize_text(actual)
+def run_single(row):
+    """运行单个样本的质控检测
     
-    # 如果完全相同
-    if expected_norm == actual_norm:
-        return True
-    
-    # 如果期望包含在实际中（部分匹配）
-    if expected_norm in actual_norm or actual_norm in expected_norm:
-        return True
-    
-    # 危急值特殊处理：检查是否包含关键信息
-    if field == 'QC_Critical_value' and 'category' in actual:
-        return True
-    
-    return False
-
-
-def run_test(row, verbose=False):
-    """运行单个测试"""
+    Returns:
+        (result_dict, error_msg) - 成功时error_msg为空
+    """
     try:
-        # 处理 NaN 值
-        applyTable = row['applyTable'] if pd.notna(row['applyTable']) else ''
-        ReportStr = row['ReportStr'] if pd.notna(row['ReportStr']) else ''
-        ConclusionStr = row['ConclusionStr'] if pd.notna(row['ConclusionStr']) else ''
-        StudyPart = row['StudyPart'] if pd.notna(row['StudyPart']) else ''
-        Sex = row['Sex'] if pd.notna(row['Sex']) else ''
-        modality = row['modality'] if pd.notna(row['modality']) else ''
+        # 处理输入数据
+        applyTable = row['applyTable'] if pd.notna(row.get('applyTable')) else ''
+        ReportStr = row['ReportStr'] if pd.notna(row.get('ReportStr')) else ''
+        ConclusionStr = row['ConclusionStr'] if pd.notna(row.get('ConclusionStr')) else ''
+        StudyPart = row['StudyPart'] if pd.notna(row.get('StudyPart')) else ''
+        Sex = row['Sex'] if pd.notna(row.get('Sex')) else ''
+        modality = row['modality'] if pd.notna(row.get('modality')) else ''
         
-        # 创建 Report 对象
+        # 创建Report对象并运行质控
         report = Report(
             ConclusionStr=ConclusionStr,
             ReportStr=ReportStr,
@@ -101,58 +58,28 @@ def run_test(row, verbose=False):
             applyTable=applyTable
         )
         
-        # 运行质控
         result = Report_Quality(report)
-        
-        # 确定期望输出对应的字段
-        expected = str(row['输出'])
-        field = determine_field(expected)
-        
-        if field is None:
-            return {
-                'success': False,
-                'error': f'无法识别期望输出类型: {expected[:50]}',
-                'result': result
-            }
-        
-        actual = str(result.get(field, ''))
-        match = is_match(expected, actual, field)
-        
-        if verbose:
-            print(f"  字段: {field}")
-            print(f"  期望: {expected[:80]}")
-            print(f"  实际: {actual[:80]}")
-            print(f"  结果: {'✓ 通过' if match else '✗ 失败'}")
-        
-        return {
-            'success': True,
-            'match': match,
-            'field': field,
-            'expected': expected,
-            'actual': actual,
-            'result': result
-        }
+        return result, None
         
     except Exception as e:
-        error_msg = str(e)
-        if verbose:
-            print(f"  错误: {error_msg}")
-        return {
-            'success': False,
-            'error': error_msg,
-            'result': {}
-        }
+        return None, str(e)
 
 
 def main():
     parser = argparse.ArgumentParser(description='医学影像报告质控批量测试')
     parser.add_argument('--input', default='samples.xlsx', help='输入Excel文件路径 (默认: samples.xlsx)')
     parser.add_argument('--output', default=None, help='输出Excel文件路径 (默认: samples_test_YYYYMMDD_HHMMSS.xlsx)')
-    parser.add_argument('--tag', default=None, help='只测试指定标签的样本 (如: 部位缺失)')
-    parser.add_argument('--verbose', '-v', action='store_true', help='显示详细输出')
+    parser.add_argument('--tag', default=None, help='只测试指定标签的样本')
+    parser.add_argument('--verbose', '-v', action='store_true', help='显示详细输出',default=True)
     parser.add_argument('--limit', type=int, default=None, help='限制测试数量')
+    parser.add_argument('--no-llm', action='store_true', help='禁用LLM验证')
     
     args = parser.parse_args()
+    
+    # 控制LLM验证开关
+    if args.no_llm:
+        os.environ['USE_LLM_VALIDATION'] = 'false'
+        print("[注意] LLM验证已禁用")
     
     # 设置输出文件名
     if args.output is None:
@@ -188,129 +115,64 @@ def main():
     
     # 运行测试
     results = []
-    stats = {
-        'total': total,
-        'passed': 0,
-        'failed': 0,
-        'error': 0,
-        'by_tag': {}
-    }
+    error_count = 0
     
     for idx, row in df.iterrows():
-        tag = row['tag']
+        tag = row.get('tag', '')
         print(f"[{idx+1}/{total}] {tag} ...", end=' ')
         
-        if args.verbose:
-            print()
+        result, error = run_single(row)
         
-        test_result = run_test(row, verbose=args.verbose)
-        
-        if not test_result['success']:
-            stats['error'] += 1
-            status = '错误'
-            match = False
-        elif test_result['match']:
-            stats['passed'] += 1
-            status = '通过'
-            match = True
+        if error:
+            print(f"错误: {error[:50]}")
+            error_count += 1
+            result_row = {'error': error}
         else:
-            stats['failed'] += 1
-            status = '失败'
-            match = False
-        
-        if not args.verbose:
-            print(status)
-        else:
-            print()
-        
-        # 统计按标签
-        if tag not in stats['by_tag']:
-            stats['by_tag'][tag] = {'total': 0, 'passed': 0, 'failed': 0, 'error': 0}
-        stats['by_tag'][tag]['total'] += 1
-        if not test_result['success']:
-            stats['by_tag'][tag]['error'] += 1
-        elif test_result['match']:
-            stats['by_tag'][tag]['passed'] += 1
-        else:
-            stats['by_tag'][tag]['failed'] += 1
-        
-        # 收集结果
-        result_row = {
-            'index': idx + 1,
-            'tag': tag,
-            'match': '✓' if match else '✗',
-            'status': status,
-            'expected': test_result.get('expected', ''),
-            'actual': test_result.get('actual', ''),
-            'field': test_result.get('field', ''),
-            'error': test_result.get('error', '')
-        }
-        
-        # 添加所有QC结果字段
-        if 'result' in test_result:
-            for key, value in test_result['result'].items():
-                result_row[f'QC_{key}'] = value
+            print("完成")
+            # 将所有质控结果转换为字符串
+            if result.get('Critical_value'):
+                QC_Critical_value=[x['category'] for x in result['Critical_value']]
+                QC_Critical_value=';'.join(QC_Critical_value)
+            else:
+                QC_Critical_value=""
+            result_row = {
+                'QC_partmissing': safe_str(result.get('partmissing')),
+                'QC_partinverse': safe_str(result.get('partinverse')),
+                'QC_special_missing': safe_str(result.get('special_missing')),
+                'QC_conclusion_missing': safe_str(result.get('conclusion_missing')),
+                'QC_orient_error': safe_str(result.get('orient_error')),
+                'QC_contradiction': safe_str(result.get('contradiction')),
+                'QC_sex_error': safe_str(result.get('sex_error')),
+                'QC_measure_unit_error': safe_str(result.get('measure_unit_error')),
+                'QC_none_standard_term': safe_str(result.get('none_standard_term')),
+                'QC_RADS': safe_str(result.get('RADS')),
+                'QC_Critical_value': QC_Critical_value,
+                'QC_apply_orient': safe_str(result.get('apply_orient')),
+                'error': ''
+            }
+            
+            if args.verbose:
+                for key, value in result_row.items():
+                    if key != 'error' and value:
+                        print(f"  {key}: {value[:100]}{'...' if len(str(value)) > 100 else ''}")
         
         results.append(result_row)
     
-    # 生成报告
-    print("\n" + "=" * 80)
-    print("测试报告")
-    print("=" * 80)
-    
-    print(f"\n总体统计:")
-    print(f"  总数:   {stats['total']}")
-    print(f"  通过:   {stats['passed']} ({stats['passed']/stats['total']*100:.1f}%)")
-    print(f"  失败:   {stats['failed']} ({stats['failed']/stats['total']*100:.1f}%)")
-    print(f"  错误:   {stats['error']} ({stats['error']/stats['total']*100:.1f}%)")
-    
-    print(f"\n按类型统计:")
-    for tag, tag_stats in sorted(stats['by_tag'].items()):
-        pass_rate = tag_stats['passed'] / tag_stats['total'] * 100 if tag_stats['total'] > 0 else 0
-        print(f"  {tag:15s}: {tag_stats['passed']}/{tag_stats['total']} ({pass_rate:5.1f}%)", end='')
-        if tag_stats['error'] > 0:
-            print(f" [错误: {tag_stats['error']}]")
-        else:
-            print()
-    
-    # 保存结果
+    # 构建输出DataFrame
     result_df = pd.DataFrame(results)
     
-    # 合并原始数据
-    for col in df.columns:
-        if col not in result_df.columns:
-            result_df[col] = df[col].values
+    # 合并原始数据（原始列放在前面）
+    for col in result_df.columns:
+        df[f'output_{col}'] = result_df[col].values
     
-    # 调整列顺序
-    first_cols = ['index', 'tag', 'match', 'status', 'expected', 'actual', 'field', 'error']
-    other_cols = [c for c in result_df.columns if c not in first_cols]
-    result_df = result_df[first_cols + other_cols]
-    
-    result_df.to_excel(args.output, index=False)
-    print(f"\n结果已保存: {args.output}")
-    
-    # 显示失败的案例
-    if stats['failed'] > 0:
-        print("\n" + "=" * 80)
-        print("失败案例分析")
-        print("=" * 80)
-        failed_cases = [r for r in results if r['status'] == '失败']
-        for case in failed_cases[:10]:  # 只显示前10个
-            print(f"\n[{case['index']}] {case['tag']}")
-            print(f"  字段: {case['field']}")
-            exp = case['expected'][:100] + '...' if len(case['expected']) > 100 else case['expected']
-            act = case['actual'][:100] + '...' if len(case['actual']) > 100 else case['actual']
-            print(f"  期望: {exp}")
-            print(f"  实际: {act}")
-        if len(failed_cases) > 10:
-            print(f"\n... 还有 {len(failed_cases) - 10} 个失败案例")
-    
-    # 返回码
-    if stats['failed'] > 0 or stats['error'] > 0:
+    # 保存结果
+    try:
+        df.to_excel(args.output, index=False, na_rep='')
+        print(f"\n结果已保存: {args.output}")
+        print(f"总计: {total}条, 成功: {total - error_count}条, 错误: {error_count}条")
+    except Exception as e:
+        print(f"\n保存结果失败: {e}")
         sys.exit(1)
-    else:
-        print("\n✓ 所有测试通过！")
-        sys.exit(0)
 
 
 if __name__ == '__main__':

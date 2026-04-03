@@ -203,3 +203,6 @@ kimi.txt
 AGENTS.md
 *.m
 *.npy
+__pycache__
+*.pyc
+.vscode
