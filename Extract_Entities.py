@@ -823,6 +823,6 @@ if __name__ == '__main__':
     # output_file = BASE_DIR / 'processed_copus' / 'processed_report_data'
     # (result_df[:int(len(result_df)/2)]).to_excel(str(output_file) + "1.xlsx", index=False)
     # (result_df[int(len(result_df)/2):]).to_excel(str(output_file) + "2.xlsx", index=False)
-    test=text_extrac_process(" 左下肺前内基底段不规则团片影，性质待定，建议增强",modality="CT")
+    test=text_extrac_process(" 胆囊：体积增大，颈部见高密度影。",modality="CT")
     pprint(test)
 

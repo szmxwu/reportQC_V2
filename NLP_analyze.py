@@ -217,8 +217,8 @@ USE_BGE_RERANK = os.getenv('USE_BGE_RERANK', 'true').lower() == 'true'
 RERANK_THRESHOLD = float(os.getenv('RERANK_THRESHOLD', '0.7'))
 FALLBACK_TO_WORD2VEC = os.getenv('FALLBACK_TO_WORD2VEC', 'true').lower() == 'true'
 
-# 新重构的报告结论检查模块（可选切换）
-USE_NEW_CONCLUSION_CHECKER = os.getenv('USE_NEW_CONCLUSION_CHECKER', 'false').lower() == 'true'
+# 新重构的报告结论检查模块（可选切换，默认启用）
+USE_NEW_CONCLUSION_CHECKER = os.getenv('USE_NEW_CONCLUSION_CHECKER', 'true').lower() == 'true'
 if USE_NEW_CONCLUSION_CHECKER:
     try:
         from report_analyze.report_conclusion_checker import check_report_conclusion as check_report_conclusion_new
@@ -719,7 +719,7 @@ def applytable_error(apply_analyze,studypart_analyze, ReportStr_analyze, Conclus
             return ""
         # 使用新模块或旧函数
         if USE_NEW_CONCLUSION_CHECKER:
-            _, inverse = check_report_conclusion_new(apply_parts, all_analyze, modality)
+            _, inverse, _ = check_report_conclusion_new(apply_parts, all_analyze, modality)
         else:
             _, inverse = Check_report_conclusion(apply_parts, all_analyze, modality)
         if inverse:
@@ -1533,7 +1533,12 @@ def _validate_contradiction_with_llm(contradiction_list: list) -> list:
 # %%报告医生质控函数
 def Report_Quality(ReportTxt: Report, debug=False):
     """对初诊医生的报告进行质控，返回阳性率、报告错误等信息."""
-    start_time = time.time()
+    import time
+    timers = {}
+    total_start = time.time()
+    
+    # === Stage 1: 实体抽取 ===
+    t0 = time.time()
     studypart_analyze = text_extrac_process(
         report_text=ReportTxt.StudyPart, version="标题", modality=ReportTxt.modality) if ReportTxt.StudyPart else []
     Conclusion_analyze = text_extrac_process(report_text=ReportTxt.ConclusionStr, version="报告", 
@@ -1543,12 +1548,14 @@ def Report_Quality(ReportTxt: Report, debug=False):
     ReportTxt.applyTable=ReportTxt.applyTable.replace("  ", "\n")
     apply_analyze=text_extrac_process(report_text=ReportTxt.applyTable, version="报告", 
                                       modality=ReportTxt.modality, add_info=studypart_analyze) if ReportTxt.applyTable else []
+    timers['实体抽取'] = time.time() - t0
     
     # 为所有实体添加 ignore 字段
-    # studypart_analyze = add_ignore_field(studypart_analyze)
+    t0 = time.time()
     Conclusion_analyze = add_ignore_field(Conclusion_analyze)
     ReportStr_analyze = add_ignore_field(ReportStr_analyze)
-    # apply_analyze = add_ignore_field(apply_analyze)
+    timers['字段处理'] = time.time() - t0
+    
     missing = []
     inverse = []
     special_missing = []
@@ -1561,36 +1568,49 @@ def Report_Quality(ReportTxt: Report, debug=False):
     RADS=""
 
     # 检查漏写部位
+    t0 = time.time()
     if studypart_analyze and re.search(ignore_part,ReportTxt.StudyPart) is None:
         missing,inverse = part_missing(
             studypart_analyze, ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
-    # missing = "未检查到漏写部位" if not missing else "可能漏写部位: " + "；".join(missing)
-    # inverse = "未检查到检查项目方位错误" if not inverse else "检查项目方位可能错误: " + "；".join(inverse)
+    timers['部位缺失检查'] = time.time() - t0
+    
     # 检查漏写特殊检查
+    t0 = time.time()
     special_missing = check_special_missing(
         ReportTxt.StudyPart, ReportTxt.ReportStr+ReportTxt.ConclusionStr,
         ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
-    # special_missing = "未检查到漏写特殊检查" if not special_missing else "请注意检查方式: " + \
-    #     "；".join(special_missing)
+    timers['特殊检查'] = time.time() - t0
 
     # 检查描述与结论相符
+    t0 = time.time()
+    conclusion_perf = {}
     if "骨龄" not in ReportTxt.StudyPart:
         if USE_NEW_CONCLUSION_CHECKER:
-            conclusion_missing, orient_error = check_report_conclusion_new(
+            conclusion_missing, orient_error, conclusion_perf = check_report_conclusion_new(
                                                 Conclusion_analyze, ReportStr_analyze, ReportTxt.modality)
         else:
             conclusion_missing, orient_error = Check_report_conclusion(
                                                 Conclusion_analyze, ReportStr_analyze, ReportTxt.modality)
+    timers['描述结论检查'] = time.time() - t0
+    
+    # 提取Rerank性能统计
+    if conclusion_perf:
+        timers['Rerank调用'] = conclusion_perf.get('rerank_time', 0)
+        timers['Rerank次数'] = conclusion_perf.get('rerank_calls', 0)
     
     # 检查矛盾
+    t0 = time.time()
     if USE_NEW_CONTRADICTION_CHECKER:
         contradiction = check_contradiction_new(ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
     else:
         contradiction = check_contradiction(ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
+    timers['矛盾检查'] = time.time() - t0
     
     # === Stage 2-4: 统一批量LLM验证 ===
-    # 收集所有需要验证的结果，一次性批量验证，提高效率
+    t0 = time.time()
+    llm_validation_triggered = False
     if conclusion_missing or orient_error or contradiction:
+        llm_validation_triggered = True
         conclusion_missing, orient_error, contradiction = _batch_validate_with_llm(
             conclusion_missing,
             orient_error,
@@ -1598,7 +1618,8 @@ def Report_Quality(ReportTxt: Report, debug=False):
             ReportTxt.ReportStr,
             ReportTxt.ConclusionStr
         )
-
+    timers['LLM验证'] = time.time() - t0
+    
     # 检查性别错误
     all_analyze = ReportStr_analyze + Conclusion_analyze
 
@@ -1639,11 +1660,33 @@ def Report_Quality(ReportTxt: Report, debug=False):
     # print('------Critical_value---\n',Critical_value)
 
     #检查RADS分类
+    t0 = time.time()
     RADS=CheckRADS(ReportTxt.StudyPart, ReportTxt.ConclusionStr,ReportTxt.modality)
+    timers['RADS检查'] = time.time() - t0
+    
+    total_time = time.time() - total_start
+    timers['总计'] = total_time
     
     if debug:
-        end_time = time.time()
-        print("耗时:%.2f秒" % (end_time-start_time))
+        print("\n" + "="*60)
+        print("详细耗时统计")
+        print("="*60)
+        
+        # 提取Rerank调用次数（整数，不是时间）
+        rerank_calls = timers.pop('Rerank次数', 0)
+        
+        # 按耗时排序
+        sorted_timers = sorted(timers.items(), key=lambda x: x[1], reverse=True)
+        for name, t in sorted_timers:
+            pct = (t / total_time * 100) if total_time > 0 else 0
+            bar = "█" * int(pct / 2)
+            print(f"{name:20s}: {t:6.3f}s ({pct:5.1f}%) {bar}")
+        
+        # 显示Rerank调用次数
+        if rerank_calls:
+            print(f"{'Rerank调用次数':20s}: {int(rerank_calls):>6d}次")
+        
+        print("="*60)
 
     return {
         "partmissing": missing,#报告部位缺失
@@ -1667,16 +1710,22 @@ if __name__ == "__main__":
     # 报告医生数据结构
     a = Report(
         ReportStr = """
-    两肺纹理增多、紊乱，右下肺前内基底段见不规则团片影，周边见少许毛刺，径约25×18mm；左肺上叶舌段少许条索影。
-    气管支气管畅顺，壁不厚。纵隔内未见肿大淋巴结，双侧胸腔无积液，胸膜不厚。附见：甲状腺右叶肿大，并突向纵隔生长。
+    肝:形态、大小、各叶比例未见明确异常。肝实质密度均匀，未见明确异常密度影。
+    胆管：肝内外胆管未见明显扩张。
+    胆囊：体积增大，颈部见高密度影。
+    胰腺：形态大小、密度未见异常，胰周脂肪间隙清晰，胰管未见明显扩张。
+    脾脏:形态、大小、密度未见明确异常。
+    双肾及双肾上腺:右肾上极见低密度影，双侧肾盂、肾盏未见明显扩张积水。
+    膀胱:充盈差，形态、大小未见明显异常，腔内未见明确异常密度影，膀胱壁未见明显增厚。
+    肠曲：分布、形态及密度未见异常。
+    腹膜后:未见明显增大淋巴结。未见腹水征。
         """,
    ConclusionStr = """
-1.左下肺前内基底段不规则团片影，性质待定，建议增强。
-2.慢支炎；左肺上叶舌段少许慢性炎症。
-3.附见：甲状腺右叶肿大突向纵隔后生长，建议专科检查。
+胆囊结石，胆囊炎。左肾上极低密度灶。
+附见双侧胸腔积液伴两下肺膨胀不全，心包少量积液 。
 
    """,
-        StudyPart = '胸部(肺)',
+        StudyPart = 'CT全腹部平扫',
         Sex = '男',
         modality = "CT",
         applyTable=""
