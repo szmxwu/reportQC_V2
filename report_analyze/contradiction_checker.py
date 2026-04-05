@@ -1,18 +1,104 @@
 # -*- coding: utf-8 -*-
 """
-报告矛盾检测模块
+报告矛盾检测模块 - 完全恢复旧实现逻辑
 
-重构目标：
-1. 简化方位处理 - 避免重复遍历
-2. 收集所有矛盾 - 不只是第一个
-3. 使用Rerank验证 - 替换Word2Vec
-4. 清晰命名和数据结构
+核心逻辑（与NLP_analyze_copy.py完全一致）：
+1. 按部位和方位分组遍历
+2. 对每个组，分离positive>1（阳性）和positive<=1（阴性）实体
+3. aspect匹配过滤
+4. 使用sentence_semantics计算相似度
+5. 阈值0.78判断矛盾
 """
 
 import re
 import os
-from typing import List, Dict, NamedTuple, Optional, Tuple
-from enum import Enum
+import numpy as np
+from scipy import spatial
+from typing import List, Dict
+
+# 加载 Word2Vec 模型（延迟加载）
+_wv_model = None
+_jieba = None
+_semantics_stopwords = None
+
+def _get_word2vec_model():
+    """延迟加载Word2Vec模型"""
+    global _wv_model, _jieba, _semantics_stopwords
+    if _wv_model is None:
+        try:
+            from gensim.models import Word2Vec
+            import jieba
+            _jieba = jieba
+            
+            model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'model', 'finetuned_word2vec.m')
+            if os.path.exists(model_path):
+                _wv_model = Word2Vec.load(model_path)
+            else:
+                print(f"Word2Vec模型文件不存在: {model_path}")
+                
+            # 加载停用词
+            from .config import SystemConfig
+            _semantics_stopwords = SystemConfig.semantics_stopwords() if hasattr(SystemConfig, 'semantics_stopwords') else ''
+        except Exception as e:
+            print(f"Word2Vec模型加载失败: {e}")
+    return _wv_model
+
+
+def _avg_feature_vector(sentence: str, model) -> np.ndarray:
+    """文本转向量"""
+    if _jieba is None:
+        return np.zeros((model.wv.vector_size,), dtype='float32')
+    
+    words = _jieba.lcut(sentence)
+    feature_vec = np.zeros((model.wv.vector_size,), dtype='float32')
+    n_words = 0
+    for word in words:
+        try:
+            feature_vec = np.add(feature_vec, model.wv[word])
+            n_words += 1
+        except:
+            pass
+    if n_words > 0:
+        feature_vec = np.divide(feature_vec, n_words)
+    return feature_vec
+
+
+def _sentence_semantics(s1: str, s2: str) -> float:
+    """句子的相似度比较 - 完全恢复旧实现"""
+    model = _get_word2vec_model()
+    if model is None:
+        return 0.0
+    
+    global _semantics_stopwords
+    if _semantics_stopwords is None:
+        from .config import SystemConfig
+        _semantics_stopwords = SystemConfig.semantics_stopwords() if hasattr(SystemConfig, 'semantics_stopwords') else ''
+    
+    # 清洗句子
+    if _semantics_stopwords:
+        s1 = re.sub(rf"{_semantics_stopwords}", '', s1)
+        s2 = re.sub(rf"{_semantics_stopwords}", '', s2)
+    
+    if s1 == "" or s2 == '':
+        return 0.0
+    
+    s1_afv = _avg_feature_vector(s1, model)
+    s2_afv = _avg_feature_vector(s2, model)
+    
+    if np.sum(s1_afv) == 0 or np.sum(s2_afv) == 0:
+        sim = 0
+    else:
+        sim = 1 - spatial.distance.cosine(s1_afv, s2_afv)
+    
+    # 方位一致性调整
+    if sim > 0.5:
+        s1_o = re.findall("[左右]", s1)
+        s2_o = re.findall("[左右]", s2)
+        if s1_o != s2_o:
+            sim -= 0.05
+    
+    return sim
+
 
 # 延迟导入避免循环依赖
 def _import_from_nlp_analyze():
@@ -25,293 +111,11 @@ def _import_from_nlp_analyze():
     return nlp_module
 
 
-# Rerank配置
-USE_BGE_RERANK = os.getenv('USE_BGE_RERANK', 'true').lower() == 'true'
-RERANK_CONTRADICTION_THRESHOLD = float(os.getenv('RERANK_CONTRADICTION_THRESHOLD', '0.35'))
-
-
-class SentimentType(Enum):
-    """实体情感类型"""
-    POSITIVE = 1    # 阳性/异常 (positive > 1)
-    NEGATIVE = 2    # 阴性/正常 (positive <= 1)
-    UNKNOWN = 3     # 无法判断
-
-
-class EntityGroup(NamedTuple):
-    """按部位和方位分组的实体"""
-    part: str                           # 部位名称
-    orientation: str                    # 方位（左/右/双/空）
-    positive_entities: List[Dict]       # 阳性实体
-    negative_entities: List[Dict]       # 阴性实体
-
-
-class ContradictionPair(NamedTuple):
-    """矛盾对"""
-    negative_sentence: str      # 阴性描述
-    positive_sentence: str      # 阳性描述
-    confidence: float           # 置信度（Rerank得分）
-    part: str                   # 所属部位
-
-
-def _classify_entity_sentiment(entity: Dict) -> SentimentType:
-    """
-    判断实体的情感类型（阳性/阴性）
-    
-    阳性：positive > 1 且 不在排除列表
-    阴性：positive <= 1 且 无测量值 且 illness有效
-    """
-    nlp = _import_from_nlp_analyze()
-    
-    # 获取配置
-    exclud = getattr(nlp, 'exclud', '')
-    stopwords = getattr(nlp, 'stopwords', '')
-    
-    sentence = entity.get('original_short_sentence', '')
-    
-    # 检查排除列表
-    if exclud and re.search(rf"{exclud}", sentence):
-        return SentimentType.UNKNOWN
-    
-    positive = entity.get('positive', 0)
-    
-    if positive > 1:
-        return SentimentType.POSITIVE
-    
-    # 阴性判断：无测量值且illness有效
-    measure = entity.get('measure', 0)
-    illness = entity.get('illness', '')
-    
-    if measure == 0 and illness:
-        # 去除stopwords后检查是否还有内容
-        clean_illness = re.sub(stopwords, "", illness) if stopwords else illness
-        if len(clean_illness) > 1:
-            return SentimentType.NEGATIVE
-    
-    return SentimentType.UNKNOWN
-
-
-def _group_entities_by_part_orient(
-    entities: List[Dict],
-    key_parts: List[str]
-) -> List[EntityGroup]:
-    """
-    按部位和方位对实体进行分组
-    
-    优化：避免原实现中左右双各遍历一次的重复
-    """
-    nlp = _import_from_nlp_analyze()
-    groups = []
-    
-    for part in key_parts:
-        # 获取该部位的所有实体
-        part_entities = [
-            e for e in entities 
-            if nlp.position_in_any_partlist(part, e)
-        ]
-        
-        if not part_entities:
-            continue
-        
-        # 按方位分组
-        left = [e for e in part_entities if e.get('orientation') == '左']
-        right = [e for e in part_entities if e.get('orientation') == '右']
-        both = [e for e in part_entities if e.get('orientation') == '双']
-        none = [e for e in part_entities if e.get('orientation') == '' or e.get('orientation') is None]
-        
-        # 左方位组：左 + 双 + 无方位
-        left_pos = []
-        left_neg = []
-        for e in left + both + none:
-            sentiment = _classify_entity_sentiment(e)
-            if sentiment == SentimentType.POSITIVE:
-                left_pos.append(e)
-            elif sentiment == SentimentType.NEGATIVE:
-                left_neg.append(e)
-        
-        if left_pos and left_neg:
-            groups.append(EntityGroup(part, '左', left_pos, left_neg))
-        
-        # 右方位组：右 + 双 + 无方位
-        right_pos = []
-        right_neg = []
-        for e in right + both + none:
-            sentiment = _classify_entity_sentiment(e)
-            if sentiment == SentimentType.POSITIVE:
-                right_pos.append(e)
-            elif sentiment == SentimentType.NEGATIVE:
-                right_neg.append(e)
-        
-        if right_pos and right_neg:
-            groups.append(EntityGroup(part, '右', right_pos, right_neg))
-    
-    return groups
-
-
-def _extract_sub_parts(sentence: str, sub_part_pattern: str) -> List[str]:
-    """从句子中提取子部位"""
-    if not sub_part_pattern:
-        return []
-    return re.findall(sub_part_pattern, sentence)
-
-
-def _has_sub_part_overlap(neg_entity: Dict, pos_entity: Dict, sub_part_pattern: str) -> bool:
-    """
-    检查两个实体是否有子部位重叠
-    
-    规则：任一为空 或 存在交集 → True
-    """
-    neg_sub = _extract_sub_parts(neg_entity.get('original_short_sentence', ''), sub_part_pattern)
-    pos_sub = _extract_sub_parts(pos_entity.get('original_short_sentence', ''), sub_part_pattern)
-    
-    # 任一为空，或存在交集
-    return not neg_sub or not pos_sub or bool(set(neg_sub) & set(pos_sub))
-
-
-def _filter_by_aspect(
-    positive_entities: List[Dict],
-    negative_entity: Dict,
-    aspects: List[str]
-) -> List[Dict]:
-    """
-    根据aspect过滤阳性实体
-    
-    如果阴性实体包含某个aspect，只保留同样包含该aspect的阳性实体
-    """
-    if not aspects:
-        return positive_entities
-    
-    neg_sentence = negative_entity.get('original_short_sentence', '')
-    
-    # 检查阴性实体包含哪些aspect
-    matched_aspects = []
-    for aspect in aspects:
-        if re.search(rf"{aspect}", neg_sentence):
-            matched_aspects.append(aspect)
-    
-    if not matched_aspects:
-        # 没有匹配到aspect，返回所有
-        return positive_entities
-    
-    # 只保留包含相同aspect的阳性实体
-    filtered = []
-    for pos_entity in positive_entities:
-        pos_sentence = pos_entity.get('original_short_sentence', '')
-        if any(re.search(rf"{aspect}", pos_sentence) for aspect in matched_aspects):
-            filtered.append(pos_entity)
-    
-    return filtered if filtered else positive_entities
-
-
-def _verify_contradiction_with_rerank(
-    neg_sentence: str,
-    pos_sentence: str
-) -> float:
-    """
-    使用Rerank验证两句话是否矛盾
-    
-    Returns:
-        矛盾置信度（0-1），低于阈值表示不矛盾
-        
-    Raises:
-        RuntimeError: Rerank服务不可用
-    """
-    if not USE_BGE_RERANK:
-        # 不使用Rerank时，返回中等置信度（由调用方决定是否保留）
-        return 0.5
-    
-    nlp = _import_from_nlp_analyze()
-    matcher = nlp.get_semantic_matcher()
-    
-    if not matcher.available():
-        raise RuntimeError("BGE Rerank服务不可用，请检查服务状态")
-    
-    # Step 1: 语义相似度检查
-    emb1 = matcher.get_embedding(neg_sentence)
-    emb2 = matcher.get_embedding(pos_sentence)
-    
-    if emb1 is None or emb2 is None:
-        return 0.0
-    
-    sim = matcher.cosine_sim(emb1, emb2)
-    
-    # 相似度太低，描述的是不同病变 → 不矛盾
-    if sim < 0.3:
-        return 0.0
-    
-    # 高度相似，可能是重复描述 → 不矛盾
-    if sim > 0.85:
-        return 0.0
-    
-    # Step 2: Rerank判断语义关系
-    query = f"描述1：{neg_sentence}\n描述2：{pos_sentence}"
-    passages = [
-        "这两句话描述矛盾，一个是正常/阴性，一个是异常/阳性",
-        "这两句话描述不矛盾，可能是同一事物的不同角度描述"
-    ]
-    
-    scores = matcher.rerank(query, passages)
-    
-    if not scores or len(scores) < 2:
-        return 0.0
-    
-    contradiction_score = scores[0]
-    non_contradiction_score = scores[1]
-    
-    # 矛盾得分 > 阈值 且 高于不矛盾得分
-    if contradiction_score > RERANK_CONTRADICTION_THRESHOLD and \
-       contradiction_score > non_contradiction_score + 0.05:
-        return contradiction_score
-    
-    return 0.0
-
-
-def _find_contradictions_in_group(
-    group: EntityGroup,
-    aspects: List[str],
-    sub_part_pattern: str
-) -> List[ContradictionPair]:
-    """
-    在实体组内查找所有矛盾对
-    
-    改进：收集所有矛盾，不只是第一个
-    """
-    contradictions = []
-    
-    for neg_entity in group.negative_entities:
-        # 1. 按aspect过滤阳性实体
-        candidates = _filter_by_aspect(group.positive_entities, neg_entity, aspects)
-        
-        # 2. 按部位匹配（子部位重叠）
-        for pos_entity in candidates:
-            # 检查部位是否匹配
-            nlp = _import_from_nlp_analyze()
-            if not nlp.position_in_any_partlist(neg_entity.get('position', ''), pos_entity):
-                continue
-            
-            # 检查子部位重叠
-            if not _has_sub_part_overlap(neg_entity, pos_entity, sub_part_pattern):
-                continue
-            
-            # 3. Rerank验证
-            try:
-                confidence = _verify_contradiction_with_rerank(
-                    neg_entity['original_short_sentence'],
-                    pos_entity['original_short_sentence']
-                )
-            except RuntimeError:
-                # Rerank不可用，使用基础判断
-                confidence = 0.5
-            
-            if confidence > 0:
-                contradictions.append(ContradictionPair(
-                    negative_sentence=neg_entity['original_short_sentence'],
-                    positive_sentence=pos_entity['original_short_sentence'],
-                    confidence=confidence,
-                    part=group.part
-                ))
-    
-    # 按置信度降序排序
-    return sorted(contradictions, key=lambda x: x.confidence, reverse=True)
+# 导入配置（避免循环依赖）
+def _get_config():
+    """获取配置"""
+    from .config import SystemConfig
+    return SystemConfig
 
 
 def check_contradiction(
@@ -320,7 +124,7 @@ def check_contradiction(
     modality: str
 ) -> List[str]:
     """
-    检查报告描述与结论中的矛盾语句（新实现）
+    检查报告矛盾语句 - 完全恢复旧实现逻辑
     
     Args:
         report_analyze: 解析后的描述实体列表
@@ -328,47 +132,171 @@ def check_contradiction(
         modality: 设备类型
     
     Returns:
-        List[str]: 矛盾列表，格式与原函数兼容 [stmt1, stmt2, stmt3, stmt4, ...]
-        按置信度降序排列，每对矛盾连续出现
-    
-    Raises:
-        RuntimeError: 当Rerank服务不可用时（如启用Rerank）
+        List[str]: 矛盾列表 [stmt1, stmt2, stmt3, stmt4, ...]
     """
     nlp = _import_from_nlp_analyze()
+    cfg = _get_config()
     
-    # 获取配置
-    check_modality = getattr(nlp, 'check_modality', 'CT|MR|DR|MG')
-    key_part = getattr(nlp, 'key_part', [])
-    aspects = getattr(nlp, 'aspects', [])
-    sub_part = getattr(nlp, 'sub_part', '')
+    # 获取配置（优先从report_analyze.config，如果不存在则从NLP_analyze）
+    check_modality = cfg.check_modality() if hasattr(cfg, 'check_modality') else getattr(nlp, 'check_modality', 'CT|MR|DR|MG')
+    key_part = cfg.key_part() if hasattr(cfg, 'key_part') else getattr(nlp, 'key_part', [])
     
     # 前置检查
     if re.search(check_modality, modality) is None:
         return []
     
-    # 合并并过滤实体
-    all_entities = []
-    all_entities.extend([x for x in report_analyze if x.get('ignore') == False])
-    all_entities.extend([x for x in conclusion_analyze if x.get('ignore') == False])
+    # 合并实体（旧实现使用 ignore == False）
+    all_analyze = []
+    all_analyze.extend([x for x in report_analyze if x.get('ignore') == False])
+    all_analyze.extend([x for x in conclusion_analyze if x.get('ignore') == False])
     
-    if not all_entities:
+    if len(all_analyze) == 0:
         return []
     
-    # 按部位和方位分组
-    groups = _group_entities_by_part_orient(all_entities, key_part)
+    contradiction = []
     
-    # 收集所有矛盾
-    all_contradictions = []
-    for group in groups:
-        pairs = _find_contradictions_in_group(group, aspects, sub_part)
-        all_contradictions.extend(pairs)
+    # 按部位和方位分组（与旧实现完全一致）
+    for part in key_part:
+        # 左 + 双 + 无方位
+        key_analyze = [d for d in all_analyze 
+                       if (nlp.position_in_any_partlist(part, d)) and 
+                       (d.get('orientation') == "左" or d.get('orientation') == "双" or d.get('orientation') == "")]
+        contradiction.extend(_get_contradiction(key_analyze))
+        
+        # 右 + 双 + 无方位
+        key_analyze = [d for d in all_analyze 
+                       if (nlp.position_in_any_partlist(part, d)) and 
+                       (d.get('orientation') == "右" or d.get('orientation') == "双" or d.get('orientation') == "")]
+        contradiction.extend(_get_contradiction(key_analyze))
+        
+        # 双 + 无方位（再次检查确保覆盖）
+        key_analyze = [d for d in all_analyze 
+                       if (nlp.position_in_any_partlist(part, d)) and 
+                       (d.get('orientation') == "双" or d.get('orientation') == "")]
+        contradiction.extend(_get_contradiction(key_analyze))
     
-    # 按置信度全局排序
-    all_contradictions.sort(key=lambda x: x.confidence, reverse=True)
+    # 去重（按对去重，保持原始顺序）
+    # 将扁平列表转为对列表 [(neg1, pos1), (neg2, pos2), ...]
+    pairs = []
+    for i in range(0, len(contradiction), 2):
+        if i + 1 < len(contradiction):
+            pairs.append((contradiction[i], contradiction[i + 1]))
     
-    # 转换为原格式 [stmt1, stmt2, stmt3, stmt4, ...]
+    # 按对去重，保持顺序
+    seen_pairs = set()
+    unique_pairs = []
+    for pair in pairs:
+        if pair not in seen_pairs:
+            seen_pairs.add(pair)
+            unique_pairs.append(pair)
+    
+    # 转回扁平列表
     result = []
-    for pair in all_contradictions:
-        result.extend([pair.negative_sentence, pair.positive_sentence])
+    for neg, pos in unique_pairs:
+        result.extend([neg, pos])
     
     return result
+
+
+def _get_contradiction(key_analyze: List[Dict]) -> List[str]:
+    """
+    在实体组内查找所有矛盾对
+    
+    返回扁平化列表: [neg1, pos1, neg2, pos2, ...]
+    避免重复检测同一对矛盾
+    """
+    if len(key_analyze) == 0:
+        return []
+    
+    nlp = _import_from_nlp_analyze()
+    cfg = _get_config()
+    
+    # 获取配置（优先从report_analyze.config）
+    exclud = cfg.exclud() if hasattr(cfg, 'exclud') else getattr(nlp, 'exclud', '')
+    stopwords = cfg.stopwords() if hasattr(cfg, 'stopwords') else getattr(nlp, 'stopwords', '')
+    aspects = cfg.aspects() if hasattr(cfg, 'aspects') else getattr(nlp, 'aspects', [])
+    sub_part = cfg.sub_part() if hasattr(cfg, 'sub_part') else getattr(nlp, 'sub_part', '')
+    
+    # 分离阳性（positive > 1）和阴性（positive <= 1）
+    positive_key = [d for d in key_analyze 
+                    if d.get('positive', 0) > 1 and
+                    re.search(rf"{exclud}", d.get('original_short_sentence', '')) == None]
+    
+    negative_key = [d for d in key_analyze 
+                    if d.get('positive', 0) <= 1 and 
+                    d.get('measure', 0) == 0 and 
+                    len(re.sub(stopwords, "", d.get('illness', ''))) > 1 and 
+                    re.search(rf"{exclud}", d.get('original_short_sentence', '')) == None]
+    
+    if len(negative_key) == 0 or len(positive_key) == 0:
+        return []
+    
+    # 收集所有矛盾对，避免重复
+    contradictions = []
+    detected_pairs = set()  # 用于去重
+    
+    for neg_sentence in negative_key:
+        neg_text = neg_sentence.get('original_short_sentence', '')
+        found = False
+        
+        # 先尝试aspect匹配
+        for aspect in aspects:
+            if re.search(rf"{aspect}", neg_text):
+                positive_str = _get_positive_key(neg_sentence, aspect, positive_key)
+                found = True
+                if positive_str != "":
+                    pair_key = (neg_text, positive_str)
+                    if pair_key not in detected_pairs:
+                        detected_pairs.add(pair_key)
+                        contradictions.extend([neg_text, positive_str])
+                    break  # 找到即跳出aspect循环
+        
+        # 无aspect匹配时，尝试直接匹配
+        if not found:
+            positive_str = _get_positive_key(neg_sentence, "", positive_key)
+            if positive_str != "":
+                # 子部位匹配逻辑
+                pos_sub_part = re.findall(sub_part, positive_str)
+                neg_sub_part = re.findall(sub_part, neg_text)
+                if (pos_sub_part == [] or neg_sub_part == [] or 
+                    (set(pos_sub_part) & set(neg_sub_part))):  # 子部位存在交集
+                    pair_key = (neg_text, positive_str)
+                    if pair_key not in detected_pairs:
+                        detected_pairs.add(pair_key)
+                        contradictions.extend([neg_text, positive_str])
+    
+    return contradictions
+
+
+def _get_positive_key(neg_sentence: Dict, aspect: str, positive_key: List[Dict]) -> str:
+    """
+    获取与阴性句子最匹配的阳性句子 - 完全恢复旧实现逻辑
+    """
+    nlp = _import_from_nlp_analyze()
+    
+    # 按部位过滤
+    positive_key = [d for d in positive_key 
+                    if nlp.position_in_any_partlist(neg_sentence.get('position', ''), d)]
+    
+    # 按aspect过滤
+    if aspect != "":
+        positive_key = [d for d in positive_key 
+                        if re.search(rf"{aspect}", d.get('original_short_sentence', ''))]
+    
+    if positive_key:
+        # 使用sentence_semantics计算相似度
+        for dic in positive_key:
+            sim = _sentence_semantics(
+                neg_sentence.get('original_short_sentence', ''),
+                dic.get('original_short_sentence', '')
+            )
+            dic['_semantics'] = sim
+        
+        semantics_min = min([x['_semantics'] for x in positive_key])
+        if semantics_min <= 0.78:
+            # 返回相似度最小的（即最不相似的阳性描述）
+            for x in positive_key:
+                if x['_semantics'] == semantics_min:
+                    return x.get('original_short_sentence', '')
+    
+    return ""

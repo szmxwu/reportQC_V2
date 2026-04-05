@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>胶片数据查询</title>
+    <!-- 引入Bootstrap CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/bootstrap.min.css') }}">
+    <!-- 引入jQuery -->
+    <script src="{{ url_for('static', filename='js/jquery.min.js') }}"></script>
+    <style>
+        body {
+            padding: 20px;
+            background-color: #f8f9fa;
+        }
+        .header {
+            margin-bottom: 30px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #eee;
+        }
+        .form-container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.05);
+            margin-bottom: 30px;
+        }
+        .query-section {
+            margin-bottom: 15px;
+            padding: 15px;
+            border: 1px solid #e9ecef;
+            border-radius: 5px;
+            background-color: #f8f9fa;
+        }
+        .table-container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.05);
+            overflow-x: auto;
+        }
+        .table th {
+            background-color: #f1f5f9;
+        }
+        .table-hover tbody tr:hover {
+            background-color: rgba(13, 110, 253, 0.05);
+        }
+        .nav-tabs .nav-link.active {
+            font-weight: bold;
+            border-bottom: 3px solid #0d6efd;
+        }
+        .loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(255, 255, 255, 0.8);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        .spinner-border {
+            width: 3rem;
+            height: 3rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1 class="text-center">胶片数据查询系统</h1>
+            <p class="text-center text-muted">请选择查询方式并输入查询条件</p>
+        </div>
+        
+        <div class="form-container">
+            <form method="POST">
+                <!-- 查询方式选择 -->
+                <div class="mb-4">
+                    <label class="form-label fw-bold">查询方式</label>
+                    <div class="d-flex flex-wrap">
+                        <div class="form-check me-4">
+                            <input class="form-check-input" type="radio" name="query_type" 
+                                   id="query_date" value="date" 
+                                   {{ 'checked' if query_type == 'date' else '' }}>
+                            <label class="form-check-label" for="query_date">
+                                按日期查询(截止昨天)
+                            </label>
+                        </div>
+                        <div class="form-check me-4">
+                            <input class="form-check-input" type="radio" name="query_type" 
+                                   id="query_accno" value="accno" 
+                                   {{ 'checked' if query_type == 'accno' else '' }}>
+                            <label class="form-check-label" for="query_accno">
+                                按号码查询(全部)
+                            </label>
+                        </div>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="query_type" 
+                                   id="query_name" value="name" 
+                                   {{ 'checked' if query_type == 'name' else '' }}>
+                            <label class="form-check-label" for="query_name">
+                                按姓名查询(7天内)
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 按日期查询 -->
+                <div class="query-section" id="date-query" 
+                     style="{{ 'display:block' if query_type == 'date' else 'display:none' }}">
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <label for="start_date" class="form-label">开始时间</label>
+                            <input type="date" class="form-control" id="start_date" 
+                                   name="start_date" value="{{ start_date }}">
+                        </div>
+                        <div class="col-md-6">
+                            <label for="end_date" class="form-label">结束时间</label>
+                            <input type="date" class="form-control" id="end_date" 
+                                   name="end_date" value="{{ end_date }}">
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 按号码查询 -->
+                <div class="query-section" id="accno-query" 
+                     style="{{ 'display:block' if query_type == 'accno' else 'display:none' }}">
+                    <div class="row g-3">
+                        <div class="col-md-12">
+                            <label for="accno" class="form-label">请输入号码</label>
+                            <input type="text" class="form-control" id="accno" 
+                                   name="accno" placeholder="输入申请单号码" 
+                                   value="{{ accno_value }}">
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 按姓名查询 -->
+                <div class="query-section" id="name-query" 
+                     style="{{ 'display:block' if query_type == 'name' else 'display:none' }}">
+                    <div class="row g-3">
+                        <div class="col-md-12">
+                            <label for="name" class="form-label">请输入姓名</label>
+                            <input type="text" class="form-control" id="name" 
+                                   name="name" placeholder="输入姓名" 
+                                   value="{{ name_value }}">
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="d-grid mt-4">
+                    <button type="submit" class="btn btn-primary btn-lg">查询</button>
+                </div>
+            </form>
+        </div>
+        
+        <div class="table-container position-relative">
+            <h4 class="mb-3">查询结果</h4>
+            <div id="table-content">
+                {% if table_html %}
+                    {{ table_html|safe }}
+                {% else %}
+                    <p class="text-muted text-center">暂无数据，请查询</p>
+                {% endif %}
+            </div>
+            <div id="loading-overlay" class="loading-overlay" style="display: none;">
+                <div class="text-center">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">加载中...</span>
+                    </div>
+                    <p class="mt-2">数据加载中，请稍候...</p>
+                </div>
+            </div>
+        </div>    
+    </div>
+
+    <!-- 查询方式切换脚本 -->
+    <script>
+    $(document).ready(function() {
+        // 切换查询方式
+        $('input[name="query_type"]').change(function() {
+            const type = $(this).val();
+            
+            // 隐藏所有查询区域
+            $('.query-section').hide();
+            
+            // 显示选中的查询区域
+            $(`#${type}-query`).show();
+        });
+        // 表单提交处理
+        $('form').submit(function(e) {
+            const queryType = $('input[name="query_type"]:checked').val();
+            let isValid = true;
+            
+            // 清空现有表格
+            $('#table-content').html('');
+            
+            // 验证输入
+            if (queryType === 'accno') {
+                const accno = $('#accno').val().trim();
+                if (!accno) {
+                    alert('请输入号码');
+                    isValid = false;
+                }
+            } else if (queryType === 'name') {
+                const name = $('#name').val().trim();
+                if (!name) {
+                    alert('请输入姓名');
+                    isValid = false;
+                }
+            }
+            
+            if (!isValid) {
+                // 显示空数据提示
+                $('#table-content').html('<p class="text-muted text-center">暂无数据，请查询</p>');
+                return false;
+            }
+            
+            // 显示加载状态
+            $('#loading-overlay').show();
+            
+            // 允许表单提交
+            return true;
+        });
+
+        // 自动调整列宽
+        function autoResizeColumns() {
+            const table = $('#data-table');
+            if (table.length === 0) return;
+            
+            table.css('width', 'auto');
+            
+            table.find('th').each(function() {
+                const header = $(this);
+                let maxWidth = header.outerWidth();
+                
+                // 获取对应列的所有单元格
+                const colIndex = header.index() + 1;
+                const cells = table.find(`td:nth-child(${colIndex})`);
+                
+                // 找出最宽的内容
+                cells.each(function() {
+                    const cellWidth = $(this).outerWidth();
+                    if (cellWidth > maxWidth) maxWidth = cellWidth;
+                });
+                
+                // 设置列宽
+                header.css('min-width', maxWidth + 'px');
+                cells.css('min-width', maxWidth + 'px');
+            });
+            
+            // 恢复表格宽度
+            table.css('width', '100%');
+        }
+        
+        // 页面加载完成后执行
+        autoResizeColumns();
+        
+        // 窗口大小变化时重新调整
+        $(window).resize(autoResizeColumns);
+    });
+    </script>
+</body>
+</html>

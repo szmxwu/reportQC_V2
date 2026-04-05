@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>智能报告检索</title>
+    <style type="text/css">
+        body{
+            padding: 30;
+            margin: 30;
+        }
+        .form1{
+            width: 500px;
+            height: 60px;
+            font-size: 30px;
+        }
+        #inp{width: 200%;height: 50px;font-size: 20px;}
+        #sub{font-size: 30px;width: 50%;position: relative;left: 760px;}
+    </style>
+  </head>
+  <body>
+    <center><h1>AI智能查询</h1></center><br><br>
+    <form action="" method="post" class="form1">
+      请输入检索条件:
+      <input type="text" name="SearchStr" id="inp"/>
+      <br>
+      <input type="submit" name="submit" id="sub"/>
+    </form>
+    <br><br><br><br><br>
+    <h3>请输入查询条件，多个条件可用AND/OR隔开，但AND和OR不能同时出现</h3>
+    <h3>示例：前降支狭窄>50% and 左旋支狭窄大于50%</h3>
+    <br><br><br><br><br>
+    <h2><a id="complexSearch_link" href="/complexSearch" class="hidden mt-3">复合智能查询（病例追踪）</a></h2>
+  </body>
+</html>

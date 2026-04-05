@@ -6,6 +6,7 @@ import os
 import json
 import requests
 from typing import List, Dict, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from json_repair import repair_json
 # 加载环境变量
@@ -204,16 +205,71 @@ class LLMValidator:
             print(f"LLM validation error: {e}")
             return (True, 0.0, f"LLM验证失败: {str(e)}")
     
+    def _validate_single(self, candidate: Dict) -> Optional[Dict]:
+        """
+        验证单个候选
+        
+        Returns: 验证后的候选字典，如果验证失败返回None（将被丢弃）
+        """
+        try:
+            if candidate['type'] == 'conclusion_missing':
+                is_valid, conf, reason = self.validate_conclusion_missing(
+                    candidate['description'],
+                    candidate['conclusion'],
+                    candidate['suspected']
+                )
+            elif candidate['type'] == 'orient_error':
+                is_valid, conf, reason = self.validate_orient_error(
+                    candidate['description'],
+                    candidate['conclusion']
+                )
+            elif candidate['type'] == 'contradiction':
+                is_valid, conf, reason = self.validate_contradiction(
+                    candidate['statement1'],
+                    candidate['statement2']
+                )
+            else:
+                # 未知类型直接返回
+                return candidate
+            
+            # 置信度判断
+            if conf == 0.0 and "LLM验证失败" in reason:
+                # 超时或错误，标记为待审核
+                candidate['needs_review'] = True
+                candidate['review_reason'] = reason
+                return candidate
+            elif is_valid and conf >= self.confidence_threshold:
+                # 高置信度真阳性
+                candidate['confidence'] = conf
+                candidate['llm_reason'] = reason
+                return candidate
+            elif is_valid and conf >= 0.5:
+                # 中置信度，保留但标记
+                candidate['confidence'] = conf
+                candidate['llm_reason'] = reason
+                candidate['weak_positive'] = True
+                return candidate
+            else:
+                # 低置信度，丢弃（假阳性）
+                return None
+                
+        except Exception as e:
+            print(f"Validation error for candidate: {e}")
+            candidate['needs_review'] = True
+            candidate['review_reason'] = f"验证异常: {str(e)}"
+            return candidate
+    
     def batch_validate(
         self,
         candidates: List[Dict]
     ) -> List[Dict]:
         """
-        批量验证候选问题
+        批量验证候选问题 - 使用线程池并发处理
         
         candidates: [
             {"type": "conclusion_missing", "description": "...", "conclusion": "...", "suspected": "..."},
             {"type": "orient_error", "description": "...", "conclusion": "..."},
+            {"type": "contradiction", "statement1": "...", "statement2": "..."},
             ...
         ]
         
@@ -222,54 +278,24 @@ class LLMValidator:
         if not self.use_llm or not self.available():
             return candidates
         
+        if not candidates:
+            return []
+        
         validated = []
         
-        for candidate in candidates:
-            try:
-                if candidate['type'] == 'conclusion_missing':
-                    is_valid, conf, reason = self.validate_conclusion_missing(
-                        candidate['description'],
-                        candidate['conclusion'],
-                        candidate['suspected']
-                    )
-                elif candidate['type'] == 'orient_error':
-                    is_valid, conf, reason = self.validate_orient_error(
-                        candidate['description'],
-                        candidate['conclusion']
-                    )
-                elif candidate['type'] == 'contradiction':
-                    is_valid, conf, reason = self.validate_contradiction(
-                        candidate['statement1'],
-                        candidate['statement2']
-                    )
-                else:
-                    validated.append(candidate)
-                    continue
-                
-                # 置信度判断
-                if conf == 0.0 and "LLM验证失败" in reason:
-                    # 超时或错误，标记为待审核
-                    candidate['needs_review'] = True
-                    candidate['review_reason'] = reason
-                    validated.append(candidate)
-                elif is_valid and conf >= self.confidence_threshold:
-                    # 高置信度真阳性
-                    candidate['confidence'] = conf
-                    candidate['llm_reason'] = reason
-                    validated.append(candidate)
-                elif is_valid and conf >= 0.5:
-                    # 中置信度，保留但标记
-                    candidate['confidence'] = conf
-                    candidate['llm_reason'] = reason
-                    candidate['weak_positive'] = True
-                    validated.append(candidate)
-                # else: 低置信度，丢弃（假阳性）
-                
-            except Exception as e:
-                print(f"Validation error for candidate: {e}")
-                candidate['needs_review'] = True
-                candidate['review_reason'] = f"验证异常: {str(e)}"
-                validated.append(candidate)
+        # 使用线程池并发处理
+        with ThreadPoolExecutor(max_workers=self.batch_size) as executor:
+            # 提交所有任务
+            future_to_candidate = {
+                executor.submit(self._validate_single, candidate): candidate 
+                for candidate in candidates
+            }
+            
+            # 收集结果
+            for future in as_completed(future_to_candidate):
+                result = future.result()
+                if result is not None:
+                    validated.append(result)
         
         return validated
     

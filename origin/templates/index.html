@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>检查费用查询</title>
+  </head>
+  <body>
+    <form action="" method="post">
+      <h1>费用明细查询</h1> 
+      请输入申请单号码：
+      <input type="text" name="applyNo" />
+      <br />
+      <input type="submit" name="submit" />
+    </form>
+    <br>
+    <br>
+    <h1>放射科收费错误列表浏览</h1>
+    <h3>因服务器性能，每次浏览不能超过一个月，若需下载请点击下方链接</h3>
+    <form action="" method="post">
+      请输入费用查询开始时间:
+      <input type="text" name="startYear" />年
+      <input type="text" name="startMonth" />月
+      <input type="text" name="startDay" />日
+      <br>
+      请输入费用查询结束时间:
+      <input type="text" name="endYear" />年
+      <input type="text" name="endMonth" />月
+      <input type="text" name="endDay" />日
+      <br>
+      <input type="submit" name="submit" />
+    </form>
+    <br><br><br>
+    <h1><a id="critical_download_link" href="/index2" class="hidden mt-3">收费错误excel文件下载</a></h1>
+
+  </body>
+</html>

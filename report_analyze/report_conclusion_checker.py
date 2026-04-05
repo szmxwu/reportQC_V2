@@ -10,8 +10,10 @@
 
 import re
 import os
+import numpy as np
 from typing import List, Dict, NamedTuple, Optional, Tuple
 from dataclasses import dataclass
+from scipy import spatial
 
 # 从NLP_analyze导入必要的依赖
 # 注意：这些是运行时导入，避免循环依赖
@@ -31,25 +33,138 @@ def _import_from_nlp_analyze():
 USE_BGE_RERANK = os.getenv('USE_BGE_RERANK', 'true').lower() == 'true'
 RERANK_THRESHOLD = float(os.getenv('RERANK_THRESHOLD', '0.7'))
 
+# 术后相关配置
+POSTOPERATIVE_THRESHOLD = float(os.getenv('POSTOPERATIVE_THRESHOLD', '0.5'))
+POSTOPERATIVE_PATTERNS = ['术后', '术后改变', '术后复查', '术区', '术后状态', '术后所见']
+
+
+def _is_postoperative_related(entity: Dict) -> bool:
+    """检查实体是否与术后相关"""
+    # 检查原始句子
+    original = entity.get('original_short_sentence', '')
+    short = entity.get('short_sentence', '')
+    illness = entity.get('illness', '')
+    
+    text_to_check = f"{original} {short} {illness}"
+    return any(pattern in text_to_check for pattern in POSTOPERATIVE_PATTERNS)
+
+# Word2Vec模型（延迟加载）
+_wv_model = None
+_jieba = None
+
+def _get_word2vec_model():
+    """延迟加载Word2Vec模型"""
+    global _wv_model, _jieba
+    if _wv_model is None:
+        try:
+            from gensim.models import Word2Vec
+            import jieba
+            _jieba = jieba
+            model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'model', 'finetuned_word2vec.m')
+            if os.path.exists(model_path):
+                _wv_model = Word2Vec.load(model_path)
+            else:
+                print(f"Word2Vec模型文件不存在: {model_path}")
+        except Exception as e:
+            print(f"Word2Vec模型加载失败: {e}")
+    return _wv_model
+
+
+def _sentence_semantics_w2v(sentence1: str, sentence2: str) -> float:
+    """
+    使用Word2Vec计算句子语义相似度
+    
+    Returns:
+        相似度分数 (0-1)，-1表示模型不可用
+    """
+    model = _get_word2vec_model()
+    if model is None:
+        return -1
+    
+    # 获取停用词
+    from .config import SystemConfig
+    stopwords = SystemConfig.semantics_stopwords() if hasattr(SystemConfig, 'semantics_stopwords') else ''
+    
+    # 清洗句子
+    if stopwords:
+        s1 = re.sub(rf"{stopwords}", '', sentence1)
+        s2 = re.sub(rf"{stopwords}", '', sentence2)
+    else:
+        s1, s2 = sentence1, sentence2
+    
+    if not s1 or not s2:
+        return 0.0
+    
+    # 分词并计算平均向量
+    def get_avg_vector(text):
+        words = _jieba.lcut(text)
+        vectors = []
+        for word in words:
+            if word in model.wv:
+                vectors.append(model.wv[word])
+        if not vectors:
+            return np.zeros(model.vector_size)
+        return np.mean(vectors, axis=0)
+    
+    vec1 = get_avg_vector(s1)
+    vec2 = get_avg_vector(s2)
+    
+    if np.sum(vec1) == 0 or np.sum(vec2) == 0:
+        return 0.0
+    
+    # 计算余弦相似度
+    sim = 1 - spatial.distance.cosine(vec1, vec2)
+    
+    # 方位一致性调整
+    if sim > 0.5:
+        s1_o = re.findall("[左右]", sentence1)
+        s2_o = re.findall("[左右]", sentence2)
+        if s1_o != s2_o:
+            sim -= 0.05
+    
+    return sim
+
+
 # 性能计时器（用于debug）
 _rerank_call_count = 0
 _rerank_total_time = 0.0
 _embedding_total_time = 0.0
+_semantic_sim_count = 0
+_semantic_sim_time = 0.0
+
+
+def _map_positive_value(positive: int) -> int:
+    """
+    映射 positive 值以兼容原设计逻辑
+    
+    新版 Extract_Entities:
+      positive=0,1 → 阴性/正常 (映射为 0)
+      positive=2,3 → 阳性/异常 (映射为 1)
+    """
+    if positive is None:
+        return 0
+    return 1 if positive >= 2 else 0
+
 
 def get_performance_stats():
     """获取性能统计信息"""
     return {
         'rerank_calls': _rerank_call_count,
         'rerank_time': _rerank_total_time,
-        'embedding_time': _embedding_total_time
+        'embedding_time': _embedding_total_time,
+        'semantic_sim_calls': _semantic_sim_count,
+        'semantic_sim_time': _semantic_sim_time
     }
 
 def reset_performance_stats():
     """重置性能统计信息"""
     global _rerank_call_count, _rerank_total_time, _embedding_total_time
+    global _semantic_sim_count, _semantic_sim_time
     _rerank_call_count = 0
     _rerank_total_time = 0.0
     _embedding_total_time = 0.0
+    _semantic_sim_count = 0
+    _semantic_sim_time = 0.0
 
 
 class MatchCandidate(NamedTuple):
@@ -81,6 +196,10 @@ def _check_match_with_rerank(report_entity: Dict, conclusion_candidates: List[Di
     
     使用short_sentence（预处理后补全的文本）进行匹配，
     输出时仍使用original_short_sentence
+    
+    特殊处理：术后相关描述使用降低的阈值（0.5），解决如：
+    - 描述:"右侧肺野缩小" vs 结论:"右肺术后改变"
+    Rerank无法理解这种医学相关性，需要降低阈值容忍度
     
     Returns:
         (best_match, max_score) - 最佳匹配的结论实体和得分
@@ -114,9 +233,30 @@ def _check_match_with_rerank(report_entity: Dict, conclusion_candidates: List[Di
     
     max_score = max(scores)
     best_idx = scores.index(max_score)
+    best_match = conclusion_candidates[best_idx]
     
-    if max_score >= RERANK_THRESHOLD:
-        return conclusion_candidates[best_idx], max_score
+    # 确定使用哪个阈值
+    # 检查描述或最佳匹配结论是否与术后相关
+    is_report_postop = _is_postoperative_related(report_entity)
+    is_conclusion_postop = _is_postoperative_related(best_match)
+    
+    threshold = RERANK_THRESHOLD
+    if is_report_postop or is_conclusion_postop:
+        threshold = POSTOPERATIVE_THRESHOLD
+        # 术后场景：如果部位匹配且方位不冲突，即使分数较低也接受
+        # 这解决了Rerank无法理解"肺野缩小"与"术后改变"关联性的问题
+        if max_score >= 0.3:  # 极低的门槛，只要有轻微相关性就接受
+            # 检查部位是否匹配
+            if _is_part_match_or_subset(report_entity, best_match):
+                # 检查方位是否匹配（不是左右相反）
+                if _is_orient_match(
+                    report_entity.get('orientation', ''),
+                    best_match.get('orientation', '')
+                ):
+                    return best_match, max_score
+    
+    if max_score >= threshold:
+        return best_match, max_score
     else:
         return None, max_score
 
@@ -207,7 +347,7 @@ def _is_forced_match(
     当满足以下条件时，即使语义相似度低，也默认匹配：
     1. 部位匹配或是子部位（如胆囊颈是胆囊的一部分）
     2. 描述中该部位只有1个实体（避免多实体歧义）
-    3. 描述和结论都是阳性（positive>1）
+    3. 描述和结论都是阳性（映射后的 positive=1）
     
     注意：结论中可以有多个同部位实体（如"胆囊结石，胆囊炎"），
     只要描述中只有1个，就默认匹配，解决医学知识不足的问题。
@@ -232,7 +372,8 @@ def _is_forced_match(
     # 描述中只有1个该部位实体，且是阳性
     # 结论中可以有多个（如结石+炎症），默认不是缺失
     if report_count == 1:
-        if report_entity.get('positive', 0) > 1 and conclusion_entity.get('positive', 0) > 1:
+        if (_map_positive_value(report_entity.get('positive', 0)) == 1 and 
+            _map_positive_value(conclusion_entity.get('positive', 0)) == 1):
             return True
     
     return False
@@ -242,49 +383,144 @@ def _position_matches(report_entity: Dict, conclusion_entity: Dict, upper_positi
     """
     检查描述实体和结论实体的部位是否匹配
     
-    对于上位部位（如"腹"、"胸"等），使用子集匹配
-    对于普通部位，也使用子集匹配（任一partlist子列表满足即可）
+    原版逻辑：d['position'] in s['partlist'] or s['position'] in d['partlist']
+    即：一个实体的 position 应该在另一个实体的 partlist 中
     """
-    nlp = _import_from_nlp_analyze()
+    report_pos = report_entity.get('position', '')
+    conclusion_pos = conclusion_entity.get('position', '')
     
-    # 统一使用子集匹配（与原实现一致）
-    # 检查结论的任一partlist是否是描述的任一partlist的子集，或反之
-    return (nlp.any_partlist_is_subset(conclusion_entity, report_entity) or 
-            nlp.any_partlist_is_subset(report_entity, conclusion_entity))
+    report_partlists = report_entity.get('partlist', [])
+    conclusion_partlists = conclusion_entity.get('partlist', [])
+    
+    # 提取 partlist 中的所有元素（扁平化）
+    report_elements = set()
+    for pl in report_partlists:
+        if isinstance(pl, (list, tuple)):
+            report_elements.update(pl)
+        else:
+            report_elements.add(pl)
+    
+    conclusion_elements = set()
+    for pl in conclusion_partlists:
+        if isinstance(pl, (list, tuple)):
+            conclusion_elements.update(pl)
+        else:
+            conclusion_elements.add(pl)
+    
+    # 原版逻辑：position in partlist
+    # 描述的 position 在结论的 partlist 中，或结论的 position 在描述的 partlist 中
+    if report_pos and conclusion_elements and report_pos in conclusion_elements:
+        return True
+    if conclusion_pos and report_elements and conclusion_pos in report_elements:
+        return True
+    
+    # 回退：直接比较 position
+    if report_pos and conclusion_pos and report_pos == conclusion_pos:
+        return True
+    
+    return False
 
 
 def _calc_semantic_score(report_entity: Dict, conclusion_entity: Dict) -> float:
     """
-    计算两个实体的语义相似度
+    计算两个实体的语义相似度（使用Word2Vec加权版本）
     
-    使用short_sentence（预处理后补全的文本）进行匹配，
-    以解决略写问题，如：
-    - original_short_sentence: "颈部见高密度影"
-    - short_sentence: "胆囊颈见高密度影"
+    逻辑：
+    1. partlist相似度：使用Word2Vec计算部位文本相似度
+    2. illness相似度：使用Word2Vec计算疾病描述相似度  
+    3. 加权：position_sim * 0.4 + illness_sim * 0.6
+    4. 多partlist：尝试所有组合，取最高分
+    5. 方位不一致：position_sim -= 0.1
     """
-    nlp = _import_from_nlp_analyze()
+    import time
+    global _semantic_sim_count, _semantic_sim_time
     
-    # 优先使用short_sentence（预处理后补全的文本）
-    report_sent = report_entity.get('short_sentence', '')
-    conclusion_sent = conclusion_entity.get('short_sentence', '')
+    t0 = time.time()
     
-    # 如果short_sentence为空，回退到original_short_sentence
-    if not report_sent:
-        report_sent = report_entity.get('original_short_sentence', '')
-    if not conclusion_sent:
-        conclusion_sent = conclusion_entity.get('original_short_sentence', '')
+    # 获取partlist列表
+    report_partlists = report_entity.get('partlist', [])
+    conclusion_partlists = conclusion_entity.get('partlist', [])
     
-    if not report_sent or not conclusion_sent:
+    if not report_partlists or not conclusion_partlists:
         return 0.0
     
-    # 创建临时实体用于struc_sim计算
-    report_temp = report_entity.copy()
-    report_temp['original_short_sentence'] = report_sent
+    # 计算partlist相似度（取所有组合中的最高分）
+    max_position_sim = 0.0
     
-    conclusion_temp = conclusion_entity.copy()
-    conclusion_temp['original_short_sentence'] = conclusion_sent
+    for r_pl in report_partlists:
+        r_text = ' '.join(r_pl) if isinstance(r_pl, (list, tuple)) else str(r_pl)
+        for c_pl in conclusion_partlists:
+            c_text = ' '.join(c_pl) if isinstance(c_pl, (list, tuple)) else str(c_pl)
+            
+            # 使用Word2Vec计算部位相似度
+            sim = _sentence_semantics_w2v(r_text, c_text)
+            if sim < 0:  # Word2Vec不可用
+                # 回退到简单子集判断
+                r_set = set(r_pl) if isinstance(r_pl, (list, tuple)) else {r_pl}
+                c_set = set(c_pl) if isinstance(c_pl, (list, tuple)) else {c_pl}
+                if r_set & c_set:  # 有交集
+                    sim = 0.7
+                elif r_set.issubset(c_set) or c_set.issubset(r_set):
+                    sim = 0.5
+                else:
+                    sim = 0.0
+            
+            if sim > max_position_sim:
+                max_position_sim = sim
     
-    return nlp.struc_sim(conclusion_temp, report_temp)
+    # 方位不一致惩罚
+    if report_entity.get('orientation') != conclusion_entity.get('orientation'):
+        max_position_sim -= 0.1
+    
+    # 计算illness相似度
+    report_illness = report_entity.get('illness', '')
+    conclusion_illness = conclusion_entity.get('illness', '')
+    
+    illness_sim = 0.0
+    if report_illness and conclusion_illness:
+        # 提取所有疾病描述
+        r_ill_list = [x.strip() for x in report_illness.split(",") if x.strip()]
+        c_ill_list = [x.strip() for x in conclusion_illness.split(",") if x.strip()]
+        
+        if r_ill_list and c_ill_list:
+            # 尝试所有组合，找最高相似度
+            max_illness_sim = 0.0
+            for r_ill in r_ill_list:
+                for c_ill in c_ill_list:
+                    # 优先检查包含关系（如"术后改变"包含在"纵隔旁见高密度影,呈术后改变"中）
+                    if r_ill in c_ill or c_ill in r_ill:
+                        sim = 0.5  # 包含关系给中等分数
+                    else:
+                        sim = _sentence_semantics_w2v(r_ill, c_ill)
+                        if sim < 0:  # Word2Vec不可用
+                            sim = 0.0
+                    
+                    if sim > max_illness_sim:
+                        max_illness_sim = sim
+            
+            illness_sim = max_illness_sim
+    
+    # positive状态不一致惩罚（使用映射后的值）
+    if (_map_positive_value(report_entity.get('positive')) != 
+        _map_positive_value(conclusion_entity.get('positive'))):
+        illness_sim -= 0.2
+    
+    # "信医生但防离谱"：阈值0.1，只要不太离谱就接受
+    if illness_sim < 0.1:
+        return 0.0
+    
+    # 确保不低于0
+    max_position_sim = max(0.0, max_position_sim)
+    illness_sim = max(0.0, illness_sim)
+    
+    # 加权：部位30% + 疾病70%（增加疾病权重）
+    final_sim = max_position_sim * 0.3 + illness_sim * 0.7
+    
+    elapsed = time.time() - t0
+    _semantic_sim_count += 1
+    _semantic_sim_time += elapsed
+    
+    return final_sim
 
 
 def _should_skip_for_orient_error(report_entity: Dict, conclusion_entity: Dict, 
@@ -342,10 +578,12 @@ def collect_match_candidates(
                 report_entity, conclusion_entity, orient_ignore_pattern
             )
             
-            # 只有positive>1的实体才加入方位错误检测列表
-            should_add_for_orient = (report_entity.get('positive', 0) > 1 and 
+            # 只有阳性实体（映射后positive=1）才加入方位错误检测列表
+            # "信医生但防离谱"：阈值从0.3降到0.15，减少假阳性
+            # 方位错误检测本身是高置信度判断，门槛应低于缺失检测
+            should_add_for_orient = (_map_positive_value(report_entity.get('positive', 0)) == 1 and 
                                      not skip_orient_check and 
-                                     semantic_score > 0)
+                                     semantic_score >= 0.15)
             
             if should_add_for_orient:
                 # 获取用于输出和用于匹配的句子
@@ -391,51 +629,75 @@ def find_position_matches(
     return matches
 
 
-def has_valid_rerank_match(
+def has_valid_match(
     report_entity: Dict,
     position_matches: List[Dict],
     all_report_entities: List[Dict] = None,
     all_conclusion_entities: List[Dict] = None
 ) -> bool:
     """
-    使用Rerank判断描述实体是否有有效匹配
+    判断描述实体是否有有效匹配
     
-    当Rerank认为不匹配时，会检查是否满足强制匹配条件（部位-数量兜底机制）：
-    - 部位匹配
-    - 该部位在描述和结论中都只有1个实体
-    - 都是阳性实体
+    采用旧版严格逻辑：
+    1. 结论的 position 必须在描述的 partlist 中（严格部位匹配）
+    2. 方位匹配：左右方位不相反
     
     Returns:
-        True - 有有效匹配（无论方位是否匹配，包括强制匹配）
+        True - 有有效匹配（信任医生）
         False - 无有效匹配（可能是真缺失）
-    
-    Raises:
-        RuntimeError - Rerank服务不可用
     """
     if not position_matches:
         return False
     
-    if not USE_BGE_RERANK:
-        # 不使用Rerank时，检查是否有方位匹配的候选
-        return any(
-            _is_orient_match(report_entity.get('orientation', ''), 
-                           c.get('orientation', ''))
-            for c in position_matches
-        )
+    # 获取描述的 partlist 所有元素
+    report_partlists = report_entity.get('partlist', [])
+    report_elements = set()
+    for pl in report_partlists:
+        if isinstance(pl, (list, tuple)):
+            report_elements.update(pl)
+        else:
+            report_elements.add(pl)
     
-    best_match, score = _check_match_with_rerank(report_entity, position_matches)
-    # Rerank找到匹配 = 有对应内容
-    if best_match is not None:
+    # 严格过滤：双向匹配（原版逻辑）
+    # 原版: position_in_any_partlist(A.position, B) or position_in_any_partlist(B.position, A)
+    # 即：A的position在B的partlist中，或B的position在A的partlist中
+    valid_matches = []
+    for c in position_matches:
+        conc_position = c.get('position', '')
+        conc_partlists = c.get('partlist', [])
+        conc_elements = set()
+        for pl in conc_partlists:
+            if isinstance(pl, (list, tuple)):
+                conc_elements.update(pl)
+            else:
+                conc_elements.add(pl)
+        
+        report_position = report_entity.get('position', '')
+        # 双向检查：结论position在描述partlist中，或描述position在结论partlist中
+        if conc_position in report_elements or report_position in conc_elements:
+            valid_matches.append(c)
+    
+    if not valid_matches:
+        return False
+    
+    # 检查方位匹配
+    orient_matches = [
+        c for c in valid_matches
+        if _is_orient_match(report_entity.get('orientation', ''), 
+                           c.get('orientation', ''))
+    ]
+    
+    if orient_matches:
+        # 方位匹配 → 有有效匹配
         return True
     
-    # Rerank没找到 = 检查是否满足强制匹配条件（部位-数量兜底）
+    # 方位不匹配 → 检查强制兜底（单实体场景）
     if all_report_entities is not None and all_conclusion_entities is not None:
-        for conc_entity in position_matches:
-            if _is_forced_match(report_entity, conc_entity, 
+        for c in valid_matches:
+            if _is_forced_match(report_entity, c, 
                                all_report_entities, all_conclusion_entities):
                 return True
     
-    # 没有找到匹配
     return False
 
 
@@ -449,58 +711,70 @@ def detect_missing_conclusions(
     检测结论缺失
     
     对于每个positive>1的描述实体，检查在结论中是否有对应
+    
+    注意：
+    - 'start' 是实体在短句中的开始位置，不是句子标识
+    - 使用 'sentence_index' + 'sentence_start' 或 'original_short_sentence' 标识句子
+    - 同一句话的多个实体，只要有一个匹配成功，整句话都不算缺失
     """
-    missing = []
+    # 按句子分组：使用 (sentence_index, sentence_start) 作为唯一标识
+    # 如果字段不存在，回退到使用 original_short_sentence
+    def get_sentence_key(entity):
+        sent_idx = entity.get('sentence_index')
+        sent_start = entity.get('sentence_start')
+        if sent_idx is not None and sent_start is not None:
+            return (sent_idx, sent_start)
+        # 回退：使用 original_short_sentence
+        return entity.get('original_short_sentence', '')
     
-    # 按句子start分组处理
-    sentenc_starts = set(d.get('start') for d in report_entities if d.get('start') is not None)
-    
-    for start in sentenc_starts:
-        # 获取该start位置的所有实体（排除空illness的）
-        entities = [
-            d for d in report_entities 
-            if d.get('start') == start and d.get('illness')
-        ]
-        
-        if not entities:
+    # 按句子 key 分组
+    sentence_groups: Dict[Any, List[Dict]] = {}
+    for entity in report_entities:
+        if not entity.get('illness'):
             continue
-        
-        # 检查该句子中是否有实体缺失结论
-        has_missing_in_sentence = False
-        
+        key = get_sentence_key(entity)
+        if key not in sentence_groups:
+            sentence_groups[key] = []
+        sentence_groups[key].append(entity)
+    
+    # === 第一遍扫描：收集所有匹配成功的句子 key ===
+    matched_sentence_keys = set()
+    
+    for key, entities in sentence_groups.items():
         for entity in entities:
-            if entity.get('positive', 0) <= 1:
+            if _map_positive_value(entity.get('positive', 0)) == 0:
                 continue
             if entity.get('ignore', False):
                 continue
             
-            # 找到部位匹配的结论实体
+            position_matches = find_position_matches(entity, conclusion_entities, upper_position_pattern)
+            
+            if position_matches and has_valid_match(entity, position_matches, report_entities, conclusion_entities):
+                # 该句子有匹配成功的实体，整句话都不算缺失
+                matched_sentence_keys.add(key)
+                break  # 跳出该句子的实体循环
+    
+    # === 第二遍扫描：收集缺失（排除已匹配的句子）===
+    missing = []
+    
+    for key, entities in sentence_groups.items():
+        # 如果该句子已匹配，跳过
+        if key in matched_sentence_keys:
+            continue
+        
+        # 否则检查每个实体是否真的缺失
+        for entity in entities:
+            if _map_positive_value(entity.get('positive', 0)) == 0:
+                continue
+            if entity.get('ignore', False):
+                continue
+            
             position_matches = find_position_matches(entity, conclusion_entities, upper_position_pattern)
             
             if not position_matches:
-                # 没有部位匹配，可能是真缺失
-                has_missing_in_sentence = True
-                continue
-            
-            # 使用Rerank判断是否有有效匹配（传递所有实体用于强制匹配检查）
-            if not has_valid_rerank_match(entity, position_matches, report_entities, conclusion_entities):
-                # Rerank认为没有匹配，可能是真缺失
-                has_missing_in_sentence = True
-        
-        if has_missing_in_sentence:
-            # 收集该句子中所有可能缺失的实体
-            for entity in entities:
-                if entity.get('positive', 0) <= 1:
-                    continue
-                if entity.get('ignore', False):
-                    continue
-                
-                position_matches = find_position_matches(entity, conclusion_entities, upper_position_pattern)
-                
-                if not position_matches:
-                    missing.append(entity['original_short_sentence'])
-                elif not has_valid_rerank_match(entity, position_matches, report_entities, conclusion_entities):
-                    missing.append(entity['original_short_sentence'])
+                missing.append(entity['original_short_sentence'])
+            elif not has_valid_match(entity, position_matches, report_entities, conclusion_entities):
+                missing.append(entity['original_short_sentence'])
     
     # 去重并过滤
     missing = list(set(missing))
@@ -551,7 +825,11 @@ def detect_orientation_errors(candidates: List[MatchCandidate]) -> List[str]:
     """
     检测方位错误
     
-    对方位不匹配的候选，计算其与方位匹配候选的相对概率
+    原版逻辑：
+    1. 对于每个描述，找到所有部位匹配的结论
+    2. 如果有任何一个结论方位不相反（方位匹配或无关），该描述不报方位错误
+    3. 只有当所有匹配都方位相反时，才考虑报方位错误
+    4. 报方位错误时，对比相似度差异
     """
     if not candidates:
         return []
@@ -571,35 +849,24 @@ def detect_orientation_errors(candidates: List[MatchCandidate]) -> List[str]:
         orient_matches = [c for c in group if c.is_orient_match]
         orient_mismatches = [c for c in group if not c.is_orient_match]
         
-        for mismatch in orient_mismatches:
-            prob = calc_orientation_probability(mismatch, orient_matches)
-            
-            if prob.is_error:
-                # 检查是否包含左右关键字
-                has_orient_keyword = (
-                    re.search("左|右", mismatch.report_sentence) or 
-                    re.search("左|右", mismatch.conclusion_sentence)
-                )
-                
-                if has_orient_keyword:
-                    error_text = f"[描述]{mismatch.report_sentence}；[结论]{mismatch.conclusion_sentence}"
-                    errors.append(error_text)
-    
-    # 去重：对于同一个描述，只保留概率最高的错误
-    error_by_report: Dict[str, Tuple[str, float]] = {}
-    for i, error_text in enumerate(errors):
-        # 找到对应的candidate获取概率
-        report_part = error_text.split("；[结论]")[0].replace("[描述]", "")
+        # === 原版关键逻辑：如果有方位匹配的结论，该描述不报方位错误 ===
+        # 因为已经找到正确匹配了，其他方位相反的可能是其他部位
+        if orient_matches:
+            continue  # 跳过该描述，不报方位错误
         
-        for c in candidates:
-            if c.report_sentence == report_part and not c.is_orient_match:
-                prob = calc_orientation_probability(c, 
-                    [x for x in candidates if x.report_sentence == report_part and x.is_orient_match])
-                if report_part not in error_by_report or prob.match_prob > error_by_report[report_part][1]:
-                    error_by_report[report_part] = (error_text, prob.match_prob)
-                break
+        # 只有当没有方位匹配的结论时，才从方位不匹配的里面找错误
+        for mismatch in orient_mismatches:
+            # 检查是否包含左右关键字
+            has_orient_keyword = (
+                re.search("左|右", mismatch.report_sentence) or 
+                re.search("左|右", mismatch.conclusion_sentence)
+            )
+            
+            if has_orient_keyword:
+                error_text = f"[描述]{mismatch.report_sentence}；[结论]{mismatch.conclusion_sentence}"
+                errors.append(error_text)
     
-    return [v[0] for v in error_by_report.values()]
+    return list(set(errors))
 
 
 def check_report_conclusion(
@@ -629,6 +896,10 @@ def check_report_conclusion(
     # 重置性能统计
     reset_performance_stats()
     
+    # 详细计时器
+    detailed_timers = {}
+    total_start = time.time()
+    
     nlp = _import_from_nlp_analyze()
     
     # 获取配置
@@ -639,38 +910,45 @@ def check_report_conclusion(
     
     # 前置检查
     if re.search(check_modality, modality) is None:
-        return [], []
+        return [], [], {'detailed': {}}
     
     if not report_analyze:
-        return [], []
+        return [], [], {'detailed': {}}
     
     if not conclusion_analyze:
-        # 结论为空，所有positive>1的描述都是缺失
+        # 结论为空，所有阳性（映射后positive=1）的描述都是缺失
         missing = [
             d['original_short_sentence'] 
             for d in report_analyze 
-            if d.get('positive', 0) > 1 and not miss_ignore_pattern.search(d.get('original_short_sentence', ''))
+            if _map_positive_value(d.get('positive', 0)) == 1 
+            and not miss_ignore_pattern.search(d.get('original_short_sentence', ''))
         ]
-        return list(set(missing)), []
+        return list(set(missing)), [], {'detailed': {}}
     
     # 步骤1：收集所有匹配候选（用于方位错误检测）
+    t0 = time.time()
     candidates = collect_match_candidates(
         report_analyze, 
         conclusion_analyze,
         upper_position,
         orient_ignore
     )
+    detailed_timers['收集匹配候选'] = time.time() - t0
     
     # 步骤2：检测结论缺失
+    t0 = time.time()
     conclusion_missing = detect_missing_conclusions(
         report_analyze,
         conclusion_analyze,
         upper_position,
         miss_ignore_pattern
     )
+    detailed_timers['检测结论缺失'] = time.time() - t0
     
     # 步骤3：检测方位错误
+    t0 = time.time()
     orient_error = detect_orientation_errors(candidates)
+    detailed_timers['检测方位错误'] = time.time() - t0
     
     # 步骤4：如果某描述被判为方位错误，则从缺失列表中移除
     for error_text in orient_error:
@@ -679,5 +957,14 @@ def check_report_conclusion(
     
     # 获取性能统计
     perf_stats = get_performance_stats()
+    total_elapsed = time.time() - total_start
+    
+    # 计算其他耗时（不包括上述步骤）
+    other_time = total_elapsed - sum(detailed_timers.values())
+    if other_time > 0:
+        detailed_timers['其他（初始化等）'] = other_time
+    
+    detailed_timers['总计'] = total_elapsed
+    perf_stats['detailed'] = detailed_timers
     
     return conclusion_missing, orient_error, perf_stats

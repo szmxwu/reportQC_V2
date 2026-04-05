@@ -9,11 +9,19 @@
     python run_samples_test.py --tag 部位缺失      # 只运行特定标签
     python run_samples_test.py --output result.xlsx # 指定输出文件名
     python run_samples_test.py --no-llm           # 禁用LLM验证
+
+环境变量:
+    USE_LLM_VALIDATION=true/false  # 在.env文件中设置，或使用 --no-llm 覆盖
 """
 
 import os
-# 默认启用LLM验证
-os.environ['USE_LLM_VALIDATION'] = 'true'
+
+# 尝试加载 .env 文件（如果存在）
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv 未安装，使用系统环境变量
 
 import pandas as pd
 import argparse

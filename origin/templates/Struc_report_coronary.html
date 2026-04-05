@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+    <html lang="zh">
+    <head>
+        <meta charset="UTF-8">
+        <title>冠状动脉</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <link rel="stylesheet" href="css/bootstrap.min.css">
+        <style>
+            .table {
+                width: 100%;
+                max-width: 100%;
+                margin-bottom: 1rem;
+                background-color: transparent;
+                border: 1px solid #dee2e6;
+            }
+            .table th,
+            .table td {
+                padding: 0.75rem;
+                vertical-align: top;
+                border-top: 1px solid #dee2e6;
+            }
+            .table thead th {
+                vertical-align: bottom;
+                border-bottom: 2px solid #dee2e6;
+            }
+            .table tbody + tbody {
+                border-top: 2px solid #dee2e6;
+            }
+            .table-bordered {
+                border: 1px solid #dee2e6;
+            }
+            .table-bordered th,
+            .table-bordered td {
+                border: 1px solid #dee2e6;
+            }
+            .table-bordered thead th,
+            .table-bordered thead td {
+                border-bottom-width: 2px;
+            }
+            .true-value {
+                color: red;
+            }
+            .false-value {
+                color: green;
+            }
+            .bold-column {
+                font-weight: bold;
+            }
+            .brown-column {
+                color: brown;
+            }
+            .auto-width {
+                white-space: nowrap;
+            }
+        </style>
+    </head>
+    <body>
+        <table class="table table-bordered">
+            <thead>
+                <tr>
+                    {% for column in df.columns %}
+                    <th class="auto-width">{{ column }}</th>
+                    {% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for index, row in df.iterrows() %}
+                <tr>
+                    {% for col_index in range(df.shape[1]) %}
+                    <td class="
+                        {% if col_index == 0 %}bold-column{% endif %}
+                        {% if col_index == 3 %}brown-column{% endif %}
+                        {% if row[col_index] == '阳性' %}true-value{% elif row[col_index] == '阴性' %}false-value{% endif %}
+                    ">{{ row[col_index] }}</td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </body>
+    </html>

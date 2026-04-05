@@ -1,0 +1,26 @@
+<!DOCTYPE html>  
+<html>  
+<head>  
+    <title>Processing...</title>  
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>  
+    <script>  
+        function updateProgress() {  
+            $.getJSON('/progress', function(data) {  
+                $('#progress').text(data.progress + '%');  
+                if (data.progress < 100) {  
+                    setTimeout(updateProgress, 500);  
+                } else {  
+                    window.location.href = '/download_file';  
+                }  
+            });  
+        }  
+          
+        $(document).ready(function() {  
+            updateProgress();  
+        });  
+    </script>  
+</head>  
+<body>  
+    <p>处理中... <span id="progress">0%</span></p>  
+</body>  
+</html>

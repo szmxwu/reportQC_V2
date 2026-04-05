@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Flask Data Table</title>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <style>
+        .table-container {
+            max-width: 100%;
+            overflow-x: auto;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 8px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+            white-space: nowrap;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        .pagination {
+            margin-top: 10px;
+            text-align: center;
+        }
+        .pagination button {
+            margin: 0 2px;
+            padding: 5px 10px;
+        }
+        .progress {
+            margin-bottom: 20px;
+        }
+        .control-panel {
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="control-panel">
+        <label for="start-date">开始时间:</label>
+        <input type="date" id="start-date">
+        <label for="end-date">结束时间:</label>
+        <input type="date" id="end-date">
+        <button onclick="searchData()">搜索</button>
+    </div>
+    <div class="progress">
+        <div class="progress-bar" role="progressbar" style="width: 0%;" id="progress-bar">0%</div>
+    </div>
+    <div class="table-container">
+        <table id="data-table" class="table table-striped">
+            <thead></thead>
+            <tbody></tbody>
+        </table>
+    </div>
+    <div class="pagination" id="pagination">
+        <button onclick="firstPage()">第一页</button>
+        <button onclick="prevPage()">上一页</button>
+        <span id="page-info"></span>
+        <button onclick="nextPage()">下一页</button>
+        <button onclick="lastPage()">最后一页</button>
+    </div>
+
+    <script>
+        var socket = io.connect('http://' + document.domain + ':' + location.port);
+        var data = [];
+        var currentPage = 1;
+        var rowsPerPage = 20;
+
+        function renderTable(page) {
+            var start = (page - 1) * rowsPerPage;
+            var end = start + rowsPerPage;
+            var paginatedData = data.slice(start, end);
+
+            var tableHead = $('#data-table thead');
+            var tableBody = $('#data-table tbody');
+            tableBody.empty();
+
+            if (paginatedData.length > 0) {
+                if (tableHead.is(':empty')) {
+                    var headerRow = '<tr>';
+                    for (var key in paginatedData[0]) {
+                        headerRow += '<th>' + key + '</th>';
+                    }
+                    headerRow += '</tr>';
+                    tableHead.append(headerRow);
+                }
+
+                paginatedData.forEach(function(row) {
+                    var dataRow = '<tr>';
+                    for (var key in row) {
+                        dataRow += '<td>' + row[key] + '</td>';
+                    }
+                    dataRow += '</tr>';
+                    tableBody.append(dataRow);
+                });
+
+                updatePagination();
+            }
+        }
+
+        function updatePagination() {
+            var totalPages = Math.ceil(data.length / rowsPerPage);
+            $('#page-info').text('第 ' + currentPage + ' 页，共 ' + totalPages + ' 页');
+        }
+
+        function firstPage() {
+            currentPage = 1;
+            renderTable(currentPage);
+        }
+
+        function prevPage() {
+            if (currentPage > 1) {
+                currentPage--;
+                renderTable(currentPage);
+            }
+        }
+
+        function nextPage() {
+            var totalPages = Math.ceil(data.length / rowsPerPage);
+            if (currentPage < totalPages) {
+                currentPage++;
+                renderTable(currentPage);
+            }
+        }
+
+        function lastPage() {
+            currentPage = Math.ceil(data.length / rowsPerPage);
+            renderTable(currentPage);
+        }
+
+        function searchData() {
+            var startDate = $('#start-date').val();
+            var endDate = $('#end-date').val();
+
+            if (!startDate || !endDate) {
+                alert('请先选择开始时间和结束时间');
+                return;
+            }
+
+            $.ajax({
+                url: '/generate',
+                type: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({ start_date: startDate, end_date: endDate }),
+                success: function(response) {
+                    data = [];
+                    currentPage = 1;
+                    $('#progress-bar').css('width', '0%').text('0%');
+                }
+            });
+        }
+
+        socket.on('update', function(msg) {
+            data.push(msg.data);
+            if (data.length <= rowsPerPage) {
+                renderTable(currentPage);
+            } else if (data.length % rowsPerPage === 1) {
+                updatePagination();
+            }
+
+            var progress = msg.progress;
+            $('#progress-bar').css('width', progress + '%').text(progress + '%');
+        });
+    </script>
+</body>
+</html>
