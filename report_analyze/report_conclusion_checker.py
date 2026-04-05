@@ -348,6 +348,7 @@ def _is_forced_match(
     1. 部位匹配或是子部位（如胆囊颈是胆囊的一部分）
     2. 描述中该部位只有1个实体（避免多实体歧义）
     3. 描述和结论都是阳性（映射后的 positive=1）
+    4. **方位不相反**（关键：方位相反时不强制匹配，用于方位错误检测）
     
     注意：结论中可以有多个同部位实体（如"胆囊结石，胆囊炎"），
     只要描述中只有1个，就默认匹配，解决医学知识不足的问题。
@@ -357,6 +358,13 @@ def _is_forced_match(
     - 结论："胆囊炎"（或"胆囊结石，胆囊炎"）
     - Rerank可能认为不匹配，但医学上它们是对应的
     """
+    # 检查方位是否相反（关键：方位相反时不强制匹配）
+    report_orient = report_entity.get('orientation', '')
+    conclusion_orient = conclusion_entity.get('orientation', '')
+    if ((report_orient == '左' and conclusion_orient == '右') or 
+        (report_orient == '右' and conclusion_orient == '左')):
+        return False
+    
     # 检查部位是否匹配或是子集关系
     if not _is_part_match_or_subset(report_entity, conclusion_entity):
         return False
@@ -821,57 +829,92 @@ def calc_orientation_probability(
     )
 
 
-def detect_orientation_errors(candidates: List[MatchCandidate]) -> List[str]:
+def detect_orientation_errors(
+    candidates: List[MatchCandidate],
+    conclusion_missing: List[str] = None
+) -> List[str]:
     """
     检测方位错误
     
-    原版逻辑：
-    1. 对于每个描述，找到所有部位匹配的结论
-    2. 如果有任何一个结论方位不相反（方位匹配或无关），该描述不报方位错误
-    3. 只有当所有匹配都方位相反时，才考虑报方位错误
-    4. 报方位错误时，对比相似度差异
+    完全按照旧版 origin/NLP_analyze.py Check_report_conclusion 逻辑：
+    1. 分离方位匹配(orientation_match)和方位不匹配(non_orientation_match)
+    2. 对于每个方位不匹配的项，计算 conclusion_probability 和 report_probability
+    3. 判断条件：
+       - conclusion_probability > 0.006 且 semantics >= 0.5
+       - 或 conclusion_probability == 1 且 (semantics >= 0.4 或 描述在conclusion_missing中)
+       - 同时 report_probability > 0
+    4. 按描述和结论去重，保留 match_probability 最高的项
     """
     if not candidates:
         return []
     
-    # 按描述句子分组
-    by_report: Dict[str, List[MatchCandidate]] = {}
-    for c in candidates:
-        if c.report_sentence not in by_report:
-            by_report[c.report_sentence] = []
-        by_report[c.report_sentence].append(c)
+    if conclusion_missing is None:
+        conclusion_missing = []
     
-    # 收集方位错误
-    errors = []
+    # 分离方位匹配和不匹配的（与旧版一致）
+    non_orientation_match = [c for c in candidates if not c.is_orient_match]
+    orientation_match = [c for c in candidates if c.is_orient_match]
     
-    for report_sent, group in by_report.items():
-        # 分离方位匹配和不匹配的
-        orient_matches = [c for c in group if c.is_orient_match]
-        orient_mismatches = [c for c in group if not c.is_orient_match]
+    # 收集有效的方位错误项（对应旧版 1152-1164 行）
+    valid_errors: List[Tuple[MatchCandidate, OrientationProbability]] = []
+    
+    for mismatch in non_orientation_match:
+        # report_df: 同一个描述，其他方位匹配结论的语义相似度列表
+        report_df = [x.semantic_score for x in orientation_match 
+                     if x.report_sentence == mismatch.report_sentence]
         
-        # === 原版关键逻辑：如果有方位匹配的结论，该描述不报方位错误 ===
-        # 因为已经找到正确匹配了，其他方位相反的可能是其他部位
-        if orient_matches:
-            continue  # 跳过该描述，不报方位错误
+        # conclusion_df: 同一个结论，其他方位匹配描述的语义相似度列表
+        conclusion_df = [x.semantic_score for x in orientation_match 
+                         if x.conclusion_sentence == mismatch.conclusion_sentence]
         
-        # 只有当没有方位匹配的结论时，才从方位不匹配的里面找错误
-        for mismatch in orient_mismatches:
-            # 检查是否包含左右关键字
-            has_orient_keyword = (
-                re.search("左|右", mismatch.report_sentence) or 
-                re.search("左|右", mismatch.conclusion_sentence)
+        # 计算 probability（与旧版一致）
+        report_probability = 1.0 if not report_df else mismatch.semantic_score - max(report_df)
+        conclusion_probability = 1.0 if not conclusion_df else mismatch.semantic_score - max(conclusion_df)
+        
+        # 检查描述是否在conclusion_missing中（旧版1158-1159行关键逻辑）
+        in_conclusion_missing = any(mismatch.report_sentence in x for x in conclusion_missing)
+        
+        # 判断条件（与旧版 1157-1160 行一致）
+        # cond1: conclusion_probability > 0.006 and semantics >= 0.5
+        # cond2: conclusion_probability == 1.0 and (semantics >= 0.4 or in_conclusion_missing)
+        cond1 = conclusion_probability > 0.006 and mismatch.semantic_score >= 0.5
+        cond2 = conclusion_probability == 1.0 and (mismatch.semantic_score >= 0.4 or in_conclusion_missing)
+        
+        if (cond1 or cond2) and report_probability > 0:
+            match_probability = report_probability + conclusion_probability
+            prob_info = OrientationProbability(
+                report_prob=report_probability,
+                conclusion_prob=conclusion_probability,
+                match_prob=match_probability,
+                is_error=True
             )
-            
-            # === 原版关键逻辑：语义相似度阈值过滤 ===
-            # 旧版使用0.4或0.5作为阈值，只有语义足够相似才报方位错误
-            # 语义不相似的（如"以左肺下叶为著"vs"右肺术后改变"，相似度0.34）是假阳性
-            semantics_threshold = 0.4
-            if mismatch.semantic_score < semantics_threshold:
-                continue  # 语义不相似，跳过
-            
-            if has_orient_keyword:
-                error_text = f"[描述]{mismatch.report_sentence}；[结论]{mismatch.conclusion_sentence}"
-                errors.append(error_text)
+            valid_errors.append((mismatch, prob_info))
+    
+    # 按描述去重，保留 match_probability 最高的（与旧版 1165-1172 行一致）
+    by_report: Dict[str, Tuple[MatchCandidate, OrientationProbability]] = {}
+    for item, prob in valid_errors:
+        name = item.report_sentence
+        if name not in by_report or prob.match_prob > by_report[name][1].match_prob:
+            by_report[name] = (item, prob)
+    
+    # 按结论去重，保留 match_probability 最高的（与旧版 1173-1179 行一致）
+    by_conclusion: Dict[str, Tuple[MatchCandidate, OrientationProbability]] = {}
+    for item, prob in by_report.values():
+        name = item.conclusion_sentence
+        if name not in by_conclusion or prob.match_prob > by_conclusion[name][1].match_prob:
+            by_conclusion[name] = (item, prob)
+    
+    # 生成错误列表（与旧版 1180-1181 行一致）
+    errors = []
+    for item, _ in by_conclusion.values():
+        # 检查是否包含左右关键字
+        has_orient_keyword = (
+            re.search("左|右", item.report_sentence) or 
+            re.search("左|右", item.conclusion_sentence)
+        )
+        if has_orient_keyword:
+            error_text = f"[描述]{item.report_sentence}；[结论]{item.conclusion_sentence}"
+            errors.append(error_text)
     
     return list(set(errors))
 
@@ -954,7 +997,7 @@ def check_report_conclusion(
     
     # 步骤3：检测方位错误
     t0 = time.time()
-    orient_error = detect_orientation_errors(candidates)
+    orient_error = detect_orientation_errors(candidates, conclusion_missing)
     detailed_timers['检测方位错误'] = time.time() - t0
     
     # 步骤4：如果某描述被判为方位错误，则从缺失列表中移除

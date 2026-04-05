@@ -823,6 +823,6 @@ if __name__ == '__main__':
     # output_file = BASE_DIR / 'processed_copus' / 'processed_report_data'
     # (result_df[:int(len(result_df)/2)]).to_excel(str(output_file) + "1.xlsx", index=False)
     # (result_df[int(len(result_df)/2):]).to_excel(str(output_file) + "2.xlsx", index=False)
-    test=text_extrac_process(" 脑室内积血较前范围进展",modality="CT")
+    test=text_extrac_process(" 鼻腔左侧钩突(位于中鼻甲前上方的骨性突起)形态异常其尖端部分可见一局限性软组织密度影",modality="CT")
     pprint(test)
 
