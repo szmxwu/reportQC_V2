@@ -24,10 +24,19 @@
 reportQC_v2/
 ├── NLP_analyze.py              # 主分析模块，包含报告质控核心函数
 ├── keyword_extraction.py       # 关键词抽取和实体识别模块
+├── llm_service.py              # LLM验证服务模块（Qwen3等大模型验证）
+├── run_samples_test.py         # 批量样本测试脚本（支持效率统计）
+├── api_server.py               # FastAPI服务接口
+├── report_analyze/             # 模块化质检查器包
+│   ├── __init__.py
+│   ├── report_conclusion_checker.py  # 描述-结论匹配检查
+│   ├── contradiction_checker.py      # 矛盾检测
+│   ├── llm_validator.py              # LLM批量验证
+│   └── config.py                     # 配置管理
 ├── flashtext/
 │   └── keyword.py              # 修改版FlashText关键词匹配引擎
 ├── model/
-│   ├── finetuned_word2vec.m    # 微调后的Word2Vec医学词向量模型
+│   ├── finetuned_word2vec.m    # 微调后的Word2Vec医学词向量模型（200维）
 │   └── report_word2vec_processed_balance_med_jieba.m  # 预训练词向量模型
 ├── config/
 │   ├── system_config.ini       # 系统核心配置参数
@@ -42,6 +51,7 @@ reportQC_v2/
 │   ├── Normal_measurement.xlsx # 正常测量值参考范围
 │   ├── user_dic_expand.txt     # 结巴分词自定义词典
 │   └── ignore_reports.json     # 忽略的设备和部位配置
+├── .env                        # 环境变量配置（LLM开关、API地址等）
 └── .vscode/settings.json       # VS Code编辑器配置
 ```
 
@@ -55,12 +65,15 @@ reportQC_v2/
 - **gensim** - Word2Vec词向量模型加载
 - **scipy** - 余弦相似度计算
 - **pydantic** - 数据模型验证
+- **fastapi** - API服务框架
+- **python-dotenv** - 环境变量管理
 
 ### 算法组件
 - **FlashText** - Aho-Corasick算法实现的高效关键词匹配（本地化修改版）
 - **Word2Vec** - 基于1亿放射文本语料+医学专业书籍预训练的200维词向量
 - **知识图谱** - 6级层次结构的解剖部位本体库
 - **规则引擎** - 基于正则表达式和配置文件的规则匹配系统
+- **LLM验证** - 基于Qwen3等大语言模型的后置精筛验证
 
 ## 数据模型
 
@@ -91,6 +104,18 @@ class AuditReport(BaseModel):
 ```
 
 ## 核心配置说明
+
+### .env 环境变量
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| USE_LLM_VALIDATION | false | 是否启用LLM后置验证 |
+| LLM_BASE_URL | http://192.0.0.193:9997/v1 | LLM API地址 |
+| LLM_MODEL | qwen3 | 使用的模型名称 |
+| LLM_TIMEOUT | 30 | API超时时间（秒）|
+| LLM_BATCH_SIZE | 5 | 并发验证数量 |
+| LLM_CONFIDENCE_THRESHOLD | 0.7 | 置信度阈值 |
+| POSTOPERATIVE_THRESHOLD | 0.5 | 术后相关描述匹配阈值 |
 
 ### system_config.ini / config.ini
 
@@ -125,6 +150,21 @@ cd /home/wmx/work/python/reportQC_v2
 python3 NLP_analyze.py
 ```
 
+### 批量样本测试（带效率统计）
+```bash
+# 运行所有样本
+python3 run_samples_test.py
+
+# 限制测试数量
+python3 run_samples_test.py --limit 10
+
+# 禁用LLM验证
+python3 run_samples_test.py --no-llm
+
+# 指定输出文件
+python3 run_samples_test.py --output result.xlsx
+```
+
 ### API调用示例
 ```python
 from NLP_analyze import Report, Report_Quality
@@ -156,7 +196,8 @@ print(result)
     "none_standard_term": "未检测到常见术语错误",     # 术语规范性
     "RADS": "",                                      # RADS分类检查
     "Critical_value": [],                            # 危急值列表
-    "apply_orient": ""                               # 申请单位方位错误
+    "apply_orient": "",                              # 申请单位方位错误
+    "_timers": {...}                                 # 性能统计（内部使用）
 }
 ```
 
@@ -177,8 +218,40 @@ print(result)
 ### 3. 描述-结论匹配算法
 - 基于部位知识图谱的层级匹配（父子节点关系）
 - 方位词一致性校验（左/右/双）
-- Word2Vec语义相似度计算（阈值0.5）
+- Word2Vec语义相似度计算（200维词向量，阈值0.3-0.5）
+- 强制匹配逻辑（部位-数量兜底，但排除方位相反的情况）
 - 排除模板化描述和特殊情况
+
+### 4. LLM验证流程
+- 规则引擎输出候选问题（结论缺失、方位错误、矛盾、性别错误）
+- 批量提交给LLM进行精筛验证
+- 高置信度（≥0.7）保留，中置信度（0.5-0.7）标记弱阳性，低置信度丢弃
+- 缓存机制避免重复验证
+
+## 模块化架构
+
+### report_analyze 包
+
+#### report_conclusion_checker.py
+- `detect_missing_conclusions()` - 检测结论缺失（句子级分组）
+- `detect_orientation_errors()` - 检测方位错误（概率阈值模型）
+- `check_report_conclusion()` - 主入口函数
+
+#### contradiction_checker.py
+- `check_contradiction()` - 检测同一部位的阴阳性矛盾
+
+#### llm_validator.py
+- `batch_validate_with_llm()` - 批量LLM验证（统一入口）
+- `validate_conclusion_missing()` - 结论缺失验证
+- `validate_orient_error()` - 方位错误验证
+- `validate_contradiction()` - 矛盾验证
+- `validate_sex_error()` - 性别错误验证
+
+#### config.py
+- `SystemConfig` - 系统配置（只读）
+- `UserConfig` - 用户配置（可调整）
+- `LLMConfig` - LLM验证配置
+- `PostoperativeConfig` - 术后相关配置
 
 ## 开发规范
 
@@ -189,6 +262,7 @@ print(result)
 - 关键正则表达式统一存储在配置文件中
 
 ### 配置文件管理
+- `.env`: 环境变量配置（LLM开关、API地址等），便于不同环境部署
 - `system_config.ini`: 系统级核心规则，一般不需要修改
 - `user_config.ini`: 用户级配置，可根据医院需求调整阈值
 - `*.xlsx`: 使用Excel管理规则便于非技术人员维护
@@ -204,6 +278,7 @@ print(result)
 - 主模型文件为二进制格式，配套.npy文件存储词向量
 - 模型输入：经jieba分词后的医学文本
 - 向量维度：200维
+- 词表大小：约10万医学术语
 
 ## 注意事项
 
@@ -211,7 +286,8 @@ print(result)
 2. **编码格式**: 所有文本文件使用UTF-8编码
 3. **内存占用**: 词向量模型加载后占用约500MB内存
 4. **并发处理**: 使用多进程池(multiprocessing.Pool)进行批量处理
-5. **缓存机制**: 实体抽取结果使用functools.lru_cache缓存
+5. **缓存机制**: 实体抽取结果使用functools.lru_cache缓存，LLM验证结果使用内存缓存
+6. **LLM依赖**: LLM验证需要外部大模型服务支持，可通过`.env`关闭
 
 ## 测试与验证
 
@@ -220,17 +296,51 @@ print(result)
 ```bash
 python3 keyword_extraction.py  # 测试实体抽取
 python3 NLP_analyze.py          # 测试完整质控流程
+python3 llm_service.py          # 测试LLM服务
 ```
 
 ### 批量验证
-代码中包含注释掉的批量处理示例，可用于大规模数据验证性能。
+```bash
+# 带效率统计的批量测试
+python3 run_samples_test.py --limit 100
+
+# 输出包含：
+# - 每条记录执行时间
+# - 平均/最短/最长执行时间
+# - LLM验证耗时统计
+# - 吞吐量（条/秒）
+```
+
+## 性能统计
+
+### 执行时间统计（run_samples_test.py）
+```
+效率统计
+============================================================
+总执行时间:      2.524s
+记录数:          3条
+平均执行时间:    841.28ms
+最短执行时间:    21.27ms
+最长执行时间:    1.463s
+吞吐量:          1.19条/秒
+
+LLM验证统计:
+  LLM调用次数:   1次
+  LLM总耗时:     1.438s
+  LLM平均耗时:   1.438s
+  LLM最短耗时:   1.438s
+  LLM最长耗时:   1.438s
+  LLM占比:       57.0%
+============================================================
+```
 
 ## 安全与隐私
 
 1. 系统仅处理文本数据，不存储患者影像数据
 2. 报告内容在内存中处理，不保留历史记录
 3. 危急值检测结果需人工复核确认
+4. LLM验证可通过环境变量完全禁用，确保无外发数据
 
 ---
 
-*最后更新: 2026-04-02*
+*最后更新: 2026-04-05*
