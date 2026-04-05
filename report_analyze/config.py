@@ -5,6 +5,7 @@
 集中管理所有配置读取，避免重复初始化和循环依赖
 """
 
+import os
 import re
 import configparser
 
@@ -233,17 +234,7 @@ class UserConfig:
     def missing_exclud():
         return get_user_config().get("missing", "exclud")
 
-# BGE/Rerank 配置
-import os
-
-class RerankConfig:
-    """Rerank相关配置"""
-    
-    USE_BGE_RERANK = os.getenv('USE_BGE_RERANK', 'true').lower() == 'true'
-    RERANK_THRESHOLD = float(os.getenv('RERANK_THRESHOLD', '0.7'))
-    RERANK_CONTRADICTION_THRESHOLD = float(os.getenv('RERANK_CONTRADICTION_THRESHOLD', '0.35'))
-
-
+# 术后相关配置
 class PostoperativeConfig:
     """术后相关配置 - 用于降低术后相关描述的匹配阈值"""
     

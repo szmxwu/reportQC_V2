@@ -29,24 +29,10 @@ def _import_from_nlp_analyze():
     return nlp_module
 
 
-# Rerank配置
-USE_BGE_RERANK = os.getenv('USE_BGE_RERANK', 'true').lower() == 'true'
-RERANK_THRESHOLD = float(os.getenv('RERANK_THRESHOLD', '0.7'))
-
 # 术后相关配置
 POSTOPERATIVE_THRESHOLD = float(os.getenv('POSTOPERATIVE_THRESHOLD', '0.5'))
 POSTOPERATIVE_PATTERNS = ['术后', '术后改变', '术后复查', '术区', '术后状态', '术后所见']
 
-
-def _is_postoperative_related(entity: Dict) -> bool:
-    """检查实体是否与术后相关"""
-    # 检查原始句子
-    original = entity.get('original_short_sentence', '')
-    short = entity.get('short_sentence', '')
-    illness = entity.get('illness', '')
-    
-    text_to_check = f"{original} {short} {illness}"
-    return any(pattern in text_to_check for pattern in POSTOPERATIVE_PATTERNS)
 
 # Word2Vec模型（延迟加载）
 _wv_model = None
@@ -188,77 +174,6 @@ class OrientationProbability(NamedTuple):
     conclusion_prob: float        # 相对于结论的概率差
     match_prob: float             # 综合匹配概率
     is_error: bool                # 是否判定为错误
-
-
-def _check_match_with_rerank(report_entity: Dict, conclusion_candidates: List[Dict]) -> Tuple[Optional[Dict], float]:
-    """
-    使用BGE Rerank模型检查描述和结论是否匹配
-    
-    使用short_sentence（预处理后补全的文本）进行匹配，
-    输出时仍使用original_short_sentence
-    
-    特殊处理：术后相关描述使用降低的阈值（0.5），解决如：
-    - 描述:"右侧肺野缩小" vs 结论:"右肺术后改变"
-    Rerank无法理解这种医学相关性，需要降低阈值容忍度
-    
-    Returns:
-        (best_match, max_score) - 最佳匹配的结论实体和得分
-        如果Rerank API不可用，抛出异常
-    """
-    import time
-    global _rerank_call_count, _rerank_total_time, _embedding_total_time
-    
-    if not conclusion_candidates:
-        return None, 0.0
-    
-    nlp = _import_from_nlp_analyze()
-    matcher = nlp.get_semantic_matcher()
-    
-    if not matcher.available():
-        raise RuntimeError("BGE Rerank服务不可用，请检查服务状态")
-    
-    # 准备查询和候选 - 使用short_sentence进行匹配
-    query = report_entity.get('short_sentence', '') or report_entity.get('original_short_sentence', '')
-    passages = [c.get('short_sentence', '') or c.get('original_short_sentence', '') for c in conclusion_candidates]
-    
-    # 计时Rerank调用
-    t0 = time.time()
-    scores = matcher.rerank(query, passages)
-    elapsed = time.time() - t0
-    _rerank_call_count += 1
-    _rerank_total_time += elapsed
-    
-    if not scores:
-        return None, 0.0
-    
-    max_score = max(scores)
-    best_idx = scores.index(max_score)
-    best_match = conclusion_candidates[best_idx]
-    
-    # 确定使用哪个阈值
-    # 检查描述或最佳匹配结论是否与术后相关
-    is_report_postop = _is_postoperative_related(report_entity)
-    is_conclusion_postop = _is_postoperative_related(best_match)
-    
-    threshold = RERANK_THRESHOLD
-    if is_report_postop or is_conclusion_postop:
-        threshold = POSTOPERATIVE_THRESHOLD
-        # 术后场景：如果部位匹配且方位不冲突，即使分数较低也接受
-        # 这解决了Rerank无法理解"肺野缩小"与"术后改变"关联性的问题
-        if max_score >= 0.3:  # 极低的门槛，只要有轻微相关性就接受
-            # 检查部位是否匹配
-            if _is_part_match_or_subset(report_entity, best_match):
-                # 检查方位是否匹配（不是左右相反）
-                if _is_orient_match(
-                    report_entity.get('orientation', ''),
-                    best_match.get('orientation', '')
-                ):
-                    return best_match, max_score
-    
-    if max_score >= threshold:
-        return best_match, max_score
-    else:
-        return None, max_score
 
 
 def _is_orient_match(orient1: str, orient2: str) -> bool:

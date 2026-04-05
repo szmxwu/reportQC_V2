@@ -83,10 +83,15 @@ class LLMValidator:
 {suspected_missing}
 
 请判断：
-1. 该描述是否确实在结论中未体现？
+1. 该描述是否涉及重要诊断，但确实在结论中未体现？
 2. 是否为同一部位/病变的不同表述？
 3. 置信度（0-1）
 
+举例：
+1. 【报告描述】左额叶见高密度影。【结论】基底节多发梗死。【疑似遗漏的描述】左额叶见高密度影
+    输出：{{"is_missing": true, "confidence": 1.0, "reason": "左额叶重要征象遗漏"}}
+2. 【报告描述】左额叶见高密度影，伴中线结构右移。【结论】左额叶出血。【疑似遗漏的描述】伴中线结构右移
+    输出：{{"is_missing": false, "confidence": 0.8, "reason": "中线右移是间接征象，不是主要诊断"}}
 请以JSON格式输出：
 {{"is_missing": true/false, "confidence": 0.9, "reason": "简要说明原因"}}"""
 
@@ -205,6 +210,90 @@ class LLMValidator:
             print(f"LLM validation error: {e}")
             return (True, 0.0, f"LLM验证失败: {str(e)}")
     
+    def validate_sex_error(
+        self,
+        patient_sex: str,
+        suspected_keywords: List[str],
+        report_content: str
+    ) -> Tuple[bool, float, str]:
+        """
+        验证性别错误是否为真阳性
+        
+        Args:
+            patient_sex: 患者性别 ("男" 或 "女")
+            suspected_keywords: 疑似性别冲突的关键词列表
+            report_content: 完整的报告内容（用于上下文判断）
+            
+        Returns:
+            (is_error, confidence, reason)
+        """
+        cache_key = f"se:{hash(patient_sex + ''.join(suspected_keywords) + report_content[:100])}"
+        if cache_key in self._cache:
+            self._cache_hits += 1
+            return self._cache[cache_key]
+        self._cache_misses += 1
+        
+        keywords_str = "、".join(suspected_keywords)
+        
+        prompt = f"""你是一位医学影像报告质控专家。请判断以下报告是否存在性别错误。
+
+【患者性别】
+{patient_sex}
+
+【报告中出现的疑似性别冲突关键词】
+{keywords_str}
+
+【报告内容】
+{report_content}
+
+【判断规则】
+1. 男性患者报告中出现女性专属解剖部位/疾病（如子宫、卵巢、阴道、输卵管、妊娠等）
+2. 女性患者报告中出现男性专属解剖部位/疾病（如前列腺、精囊、睾丸、阴茎等）
+3. 某些情况需要特殊考虑：
+   - 先天性异常（如两性畸形）
+   - 术后改变（如子宫切除术后男性化特征）
+   - 引用既往史（如"既往子宫切除术后"）
+   - 误用词（如"前列腺"用于描述女性盆腔结构）
+   - 引用他人报告或对比描述
+
+【输出要求】
+请以JSON格式输出，包含以下字段：
+- is_error: true/false，是否确实存在性别错误
+- confidence: 0-1之间的置信度
+- reason: 简要说明判断原因（如果是假阳性，请说明原因）
+
+【示例】
+1. 患者性别：男，关键词：子宫、卵巢
+   输出：{{"is_error": true, "confidence": 0.95, "reason": "男性报告中不应出现子宫、卵巢等女性专属器官"}}
+
+2. 患者性别：女，关键词：前列腺
+   输出：{{"is_error": true, "confidence": 0.95, "reason": "女性报告中不应出现前列腺"}}
+
+3. 患者性别：男，关键词：子宫（报告描述："盆腔术后改变，子宫已切除"）
+   输出：{{"is_error": false, "confidence": 0.85, "reason": "引用既往手术史，非当前解剖结构描述"}}
+
+4. 患者性别：女，关键词：前列腺（报告描述："前列腺形态正常"但患者为女性）
+   输出：{{"is_error": false, "confidence": 0.8, "reason": "可能是笔误或模板错误，但女性确实没有前列腺，需结合临床"}}"""
+
+        try:
+            result = self._call_llm(prompt)
+            parsed = self._parse_json_response(result)
+            
+            is_error = parsed.get('is_error', True)
+            confidence = parsed.get('confidence', 0.5)
+            reason = parsed.get('reason', '')
+            
+            result_tuple = (is_error, confidence, reason)
+            
+            if len(self._cache) < self._cache_size:
+                self._cache[cache_key] = result_tuple
+            
+            return result_tuple
+            
+        except Exception as e:
+            print(f"LLM validation error: {e}")
+            return (True, 0.0, f"LLM验证失败: {str(e)}")
+    
     def _validate_single(self, candidate: Dict) -> Optional[Dict]:
         """
         验证单个候选
@@ -227,6 +316,12 @@ class LLMValidator:
                 is_valid, conf, reason = self.validate_contradiction(
                     candidate['statement1'],
                     candidate['statement2']
+                )
+            elif candidate['type'] == 'sex_error':
+                is_valid, conf, reason = self.validate_sex_error(
+                    candidate['patient_sex'],
+                    candidate['suspected_keywords'],
+                    candidate['report_content']
                 )
             else:
                 # 未知类型直接返回

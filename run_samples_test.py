@@ -26,6 +26,7 @@ except ImportError:
 import pandas as pd
 import argparse
 import sys
+import time
 from datetime import datetime
 from NLP_analyze import Report, Report_Quality
 
@@ -45,8 +46,9 @@ def run_single(row):
     """运行单个样本的质控检测
     
     Returns:
-        (result_dict, error_msg) - 成功时error_msg为空
+        (result_dict, error_msg, elapsed_time) - 成功时error_msg为空
     """
+    start_time = time.time()
     try:
         # 处理输入数据
         applyTable = row['applyTable'] if pd.notna(row.get('applyTable')) else ''
@@ -67,10 +69,22 @@ def run_single(row):
         )
         
         result = Report_Quality(report)
-        return result, None
+        elapsed_time = time.time() - start_time
+        return result, None, elapsed_time
         
     except Exception as e:
-        return None, str(e)
+        elapsed_time = time.time() - start_time
+        return None, str(e), elapsed_time
+
+
+def format_time(seconds):
+    """格式化时间显示"""
+    if seconds < 0.001:
+        return f"{seconds*1000:.2f}μs"
+    elif seconds < 1:
+        return f"{seconds*1000:.2f}ms"
+    else:
+        return f"{seconds:.3f}s"
 
 
 def main():
@@ -125,18 +139,32 @@ def main():
     results = []
     error_count = 0
     
+    # 效率统计
+    execution_times = []  # 每条记录的执行时间
+    llm_times = []        # LLM验证时间
+    
+    # 总计时
+    total_start_time = time.time()
+    
     for idx, row in df.iterrows():
         tag = row.get('tag', '')
         print(f"[{idx+1}/{total}] {tag} ...", end=' ')
         
-        result, error = run_single(row)
+        result, error, elapsed_time = run_single(row)
+        execution_times.append(elapsed_time)
         
         if error:
             print(f"错误: {error[:50]}")
             error_count += 1
             result_row = {'error': error}
         else:
-            print("完成")
+            print(f"完成 ({format_time(elapsed_time)})")
+            # 收集LLM验证时间
+            timers = result.get('_timers', {})
+            llm_time = timers.get('LLM验证', 0)
+            if llm_time > 0:
+                llm_times.append(llm_time)
+            
             # 将所有质控结果转换为字符串
             if result.get('Critical_value'):
                 QC_Critical_value=[x['category'] for x in result['Critical_value']]
@@ -156,15 +184,20 @@ def main():
                 'QC_RADS': safe_str(result.get('RADS')),
                 'QC_Critical_value': QC_Critical_value,
                 'QC_apply_orient': safe_str(result.get('apply_orient')),
+                'execution_time': elapsed_time,  # 添加执行时间到结果
+                'llm_time': llm_time if llm_time > 0 else None,  # 添加LLM时间
                 'error': ''
             }
             
             if args.verbose:
                 for key, value in result_row.items():
-                    if key != 'error' and value:
+                    if key not in ['error', 'execution_time', 'llm_time'] and value:
                         print(f"  {key}: {value[:100]}{'...' if len(str(value)) > 100 else ''}")
         
         results.append(result_row)
+    
+    # 总耗时
+    total_elapsed_time = time.time() - total_start_time
     
     # 构建输出DataFrame
     result_df = pd.DataFrame(results)
@@ -181,6 +214,44 @@ def main():
     except Exception as e:
         print(f"\n保存结果失败: {e}")
         sys.exit(1)
+    
+    # ========== 效率统计 ==========
+    print("\n" + "="*60)
+    print("效率统计")
+    print("="*60)
+    
+    if execution_times:
+        avg_time = sum(execution_times) / len(execution_times)
+        min_time = min(execution_times)
+        max_time = max(execution_times)
+        
+        print(f"总执行时间:      {format_time(total_elapsed_time)}")
+        print(f"记录数:          {len(execution_times)}条")
+        print(f"平均执行时间:    {format_time(avg_time)}")
+        print(f"最短执行时间:    {format_time(min_time)}")
+        print(f"最长执行时间:    {format_time(max_time)}")
+        print(f"吞吐量:          {len(execution_times)/total_elapsed_time:.2f}条/秒")
+    
+    # 过滤掉接近0的LLM时间（实际未进行LLM验证的情况）
+    valid_llm_times = [t for t in llm_times if t > 0.001]
+    
+    if valid_llm_times:
+        llm_min = min(valid_llm_times)
+        llm_max = max(valid_llm_times)
+        llm_avg = sum(valid_llm_times) / len(valid_llm_times)
+        llm_total = sum(valid_llm_times)
+        
+        print(f"\nLLM验证统计:")
+        print(f"  LLM调用次数:   {len(valid_llm_times)}次")
+        print(f"  LLM总耗时:     {format_time(llm_total)}")
+        print(f"  LLM平均耗时:   {format_time(llm_avg)}")
+        print(f"  LLM最短耗时:   {format_time(llm_min)}")
+        print(f"  LLM最长耗时:   {format_time(llm_max)}")
+        print(f"  LLM占比:       {llm_total/total_elapsed_time*100:.1f}%")
+    else:
+        print(f"\nLLM验证统计: 未进行LLM验证（或LLM验证被禁用）")
+    
+    print("="*60)
 
 
 if __name__ == '__main__':

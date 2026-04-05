@@ -284,7 +284,6 @@ async def get_config():
         "llm_validation": os.getenv('USE_LLM_VALIDATION', 'true').lower() == 'true',
         "llm_model": os.getenv('LLM_MODEL', 'qwen3'),
         "llm_base_url": os.getenv('LLM_BASE_URL'),
-        "bge_rerank": os.getenv('USE_BGE_RERANK', 'true').lower() == 'true',
         "confidence_threshold": float(os.getenv('LLM_CONFIDENCE_THRESHOLD', '0.7')),
         "offline_docs": OFFLINE_DOCS_AVAILABLE
     }

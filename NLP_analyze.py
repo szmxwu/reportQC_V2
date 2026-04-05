@@ -7,7 +7,6 @@ import time
 from datetime import datetime
 import jieba  
 from Extract_Entities import text_extrac_process
-from semantic_service import get_matcher
 import warnings
 from typing import Optional, List, Dict
 from pydantic import BaseModel, Field
@@ -166,14 +165,6 @@ FemaleKeyWords = UserConfig.female_keywords()
 Exam_enhance = UserConfig.exam_enhance()
 check_modality = UserConfig.check_modality()
 missing_exclud = UserConfig.missing_exclud()
-
-# 初始化语义匹配器（供report_analyze模块使用）
-_matcher = None
-def get_semantic_matcher():
-    global _matcher
-    if _matcher is None:
-        _matcher = get_matcher()
-    return _matcher
 
 # ============ partlist 辅助函数（适配 Extract_Entities.py 的 List[tuple] 结构） ============
 
@@ -883,24 +874,29 @@ def Report_Quality(ReportTxt: Report, debug=False):
     contradiction = check_contradiction(ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
     timers['矛盾检查'] = time.time() - t0
     
+    # 检查性别错误（先做规则检查，然后一起LLM验证）
+    all_analyze = ReportStr_analyze + Conclusion_analyze
+    sex_error_str = CheckSex(all_analyze, ReportTxt.Sex)
+    sex_error = [sex_error_str] if sex_error_str else []
+    
     # === Stage 2-4: 统一批量LLM验证 ===
     t0 = time.time()
     llm_validation_triggered = False
-    if conclusion_missing or orient_error or contradiction:
+    if conclusion_missing or orient_error or contradiction or sex_error:
         llm_validation_triggered = True
-        conclusion_missing, orient_error, contradiction = batch_validate_with_llm(
+        conclusion_missing, orient_error, contradiction, sex_error = batch_validate_with_llm(
             conclusion_missing,
             orient_error,
             contradiction,
+            sex_error,
+            ReportTxt.Sex,
             ReportTxt.ReportStr,
             ReportTxt.ConclusionStr
         )
     timers['LLM验证'] = time.time() - t0
     
-    # 检查性别错误
-    all_analyze = ReportStr_analyze + Conclusion_analyze
-
-    sex_error = CheckSex(all_analyze, ReportTxt.Sex)
+    # 将 sex_error 列表转回字符串格式（保持原有输出格式）
+    sex_error = sex_error[0] if sex_error else ""
 
     # 判断测量单位错误
     measure_unit_error = CheckMeasure(ReportTxt.ReportStr+"\n"+ReportTxt.ConclusionStr)
@@ -981,6 +977,7 @@ def Report_Quality(ReportTxt: Report, debug=False):
         'RADS':RADS,#分类
         "Critical_value": Critical_value,#危急值
         "apply_orient":apply_orient,
+        "_timers": timers,  # 内部性能统计
     }
 
 
