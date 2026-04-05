@@ -862,6 +862,13 @@ def detect_orientation_errors(candidates: List[MatchCandidate]) -> List[str]:
                 re.search("左|右", mismatch.conclusion_sentence)
             )
             
+            # === 原版关键逻辑：语义相似度阈值过滤 ===
+            # 旧版使用0.4或0.5作为阈值，只有语义足够相似才报方位错误
+            # 语义不相似的（如"以左肺下叶为著"vs"右肺术后改变"，相似度0.34）是假阳性
+            semantics_threshold = 0.4
+            if mismatch.semantic_score < semantics_threshold:
+                continue  # 语义不相似，跳过
+            
             if has_orient_keyword:
                 error_text = f"[描述]{mismatch.report_sentence}；[结论]{mismatch.conclusion_sentence}"
                 errors.append(error_text)
