@@ -160,6 +160,63 @@ class QualityCheckResponse(BaseModel):
     )
 
 
+class BatchQualityCheckRequest(BaseModel):
+    """批量质控检查请求"""
+    reports: List[QualityCheckRequest] = Field(
+        ...,
+        description="报告列表（每条报告包含 id 字段用于标识）",
+        example=[
+            {
+                "ConclusionStr": "双肺未见异常。",
+                "ReportStr": "双肺纹理增多。",
+                "modality": "DR",
+                "StudyPart": "胸部",
+                "Sex": "男",
+                "applyTable": ""
+            }
+        ]
+    )
+    use_llm: bool = Field(
+        default=True,
+        description="是否启用 LLM 后置精筛"
+    )
+
+
+class BatchQualityCheckResult(BaseModel):
+    """批量检查结果单项"""
+    id: Optional[str] = Field(default=None, description="报告标识（如果在请求中提供）")
+    status: str = Field(default="success", description="处理状态: success/failed")
+    error_message: Optional[str] = Field(default=None, description="错误信息（如果失败）")
+    partmissing: Optional[str] = None
+    partinverse: Optional[str] = None
+    special_missing: Optional[str] = None
+    conclusion_missing: Optional[str] = None
+    orient_error: Optional[str] = None
+    contradiction: Optional[str] = None
+    sex_error: Optional[str] = None
+    measure_unit_error: Optional[str] = None
+    none_standard_term: Optional[str] = None
+    RADS: Optional[str] = None
+    Critical_value: Optional[List[dict]] = None
+    apply_orient: Optional[str] = None
+    grammer_error: Optional[List[dict]] = None
+    processing_time: Optional[float] = None
+
+
+class BatchQualityCheckResponse(BaseModel):
+    """批量质控检查响应"""
+    results: List[BatchQualityCheckResult] = Field(description="检查结果列表")
+    summary: dict = Field(
+        description="统计摘要",
+        example={
+            "total": 10,
+            "success": 9,
+            "failed": 1,
+            "avg_processing_time": 0.85
+        }
+    )
+
+
 class HealthResponse(BaseModel):
     """健康检查响应"""
     status: str
@@ -287,6 +344,99 @@ async def check_quality_fast(request: QualityCheckRequest):
         raise HTTPException(
             status_code=500,
             detail=f"质控处理失败: {str(e)}"
+        )
+
+
+@app.post("/api/v1/quality/check/batch", response_model=BatchQualityCheckResponse)
+async def check_quality_batch(request: BatchQualityCheckRequest):
+    """
+    批量报告质量检查
+    
+    - 支持一次检查多条报告
+    - 自动并发处理提高效率
+    - 返回每条报告的独立结果和整体统计
+    """
+    import time
+    
+    results = []
+    total_time = 0
+    success_count = 0
+    failed_count = 0
+    
+    # 临时设置 LLM 开关
+    original_use_llm = os.getenv('USE_LLM_VALIDATION')
+    if not request.use_llm:
+        os.environ['USE_LLM_VALIDATION'] = 'false'
+    
+    try:
+        for idx, report_req in enumerate(request.reports):
+            start_time = time.time()
+            
+            try:
+                # 获取报告 ID（如果有）
+                report_id = getattr(report_req, 'id', f"report_{idx}")
+                
+                # 构建 Report 对象
+                report = Report(
+                    ConclusionStr=report_req.ConclusionStr,
+                    ReportStr=report_req.ReportStr,
+                    modality=report_req.modality,
+                    StudyPart=report_req.StudyPart,
+                    Sex=report_req.Sex,
+                    applyTable=report_req.applyTable
+                )
+                
+                # 执行质控
+                result = Report_Quality(report, debug=False)
+                processing_time = time.time() - start_time
+                total_time += processing_time
+                
+                results.append(BatchQualityCheckResult(
+                    id=report_id,
+                    status="success",
+                    **result,
+                    processing_time=processing_time
+                ))
+                success_count += 1
+                
+            except Exception as e:
+                processing_time = time.time() - start_time
+                total_time += processing_time
+                
+                results.append(BatchQualityCheckResult(
+                    id=getattr(report_req, 'id', f"report_{idx}"),
+                    status="failed",
+                    error_message=str(e),
+                    processing_time=processing_time
+                ))
+                failed_count += 1
+        
+        # 恢复 LLM 设置
+        if original_use_llm:
+            os.environ['USE_LLM_VALIDATION'] = original_use_llm
+        
+        # 计算统计信息
+        avg_time = total_time / len(request.reports) if request.reports else 0
+        
+        return BatchQualityCheckResponse(
+            results=results,
+            summary={
+                "total": len(request.reports),
+                "success": success_count,
+                "failed": failed_count,
+                "avg_processing_time": round(avg_time, 3),
+                "total_processing_time": round(total_time, 3)
+            }
+        )
+        
+    except Exception as e:
+        # 恢复 LLM 设置
+        if original_use_llm:
+            os.environ['USE_LLM_VALIDATION'] = original_use_llm
+        
+        raise HTTPException(
+            status_code=500,
+            detail=f"批量质控处理失败: {str(e)}"
         )
 
 
