@@ -201,8 +201,30 @@ offline_packages
 selected_samples_details_filtered.xlsx
 kimi.txt
 AGENTS.md
-*.m
-*.npy
+# 保留主模型文件，但忽略配套的大文件
+!model/finetuned_word2vec.m
+model/*.npy
+
+# 忽略备份目录
+origin/
+
+# 忽略 grammer 模块的大文件（训练用，运行不需要）
+grammer/models/radiology_corpus.txt
+grammer/models/radiology_ngram.arpa
+grammer/models/radiology_ngram.klm      # 原文件大，使用 .gz 压缩包
+grammer/models/ac_automaton.pkl
+
+# 保留压缩包（通过例外规则）
+!grammer/models/radiology_ngram.klm.gz
+
+# 保留的小文件（必需）：
+# - ac_automaton_v2.pkl (4.4MB) - AC自动机引擎
+# - medical_confusion.txt (4.4MB) - 医学混淆词表
+# - high_risk_general.txt (429KB) - 高危词表
+# - word_order_templates.json (238KB) - 词序模板
+# - radiology_vocab.json (834KB) - 词频表
+# - substring_vocab.json (38KB) - 子串频次表
+
 __pycache__
 *.pyc
 .vscode
@@ -210,3 +232,4 @@ origin/**.pkl
 AGENTS.md
 output
 test
+kenlm

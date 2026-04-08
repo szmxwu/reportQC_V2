@@ -11,11 +11,11 @@
 | `radiology_vocab.json` | 834KB | 放射语料词频表 |
 | `substring_vocab.json` | 38KB | 子串频次表 |
 
-## 可选文件（代码有回退逻辑）
+## 可选文件（推荐下载）
 
-| 文件 | 大小 | 说明 | 回退行为 |
+| 文件 | 大小 | 说明 | 获取方式 |
 |------|------|------|----------|
-| `radiology_ngram.klm` | 84MB | KenLM语言模型 | 跳过上下文校验，不影响基础检测 |
+| `radiology_ngram.klm` | 84MB | KenLM语言模型 | 下载 `radiology_ngram.klm.gz` 后解压 |
 
 ## 训练用文件（不需要上传到仓库）
 
