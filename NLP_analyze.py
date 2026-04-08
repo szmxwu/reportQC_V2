@@ -4,12 +4,14 @@ import pandas as pd
 import numpy as np
 import re
 import time
+import sys
 from datetime import datetime
 import jieba  
 from Extract_Entities import text_extrac_process
 import warnings
 from typing import Optional, List, Dict
 from pydantic import BaseModel, Field
+from pathlib import Path
 
 # 新模块化结构
 from report_analyze import (
@@ -20,11 +22,168 @@ from report_analyze import (
     UserConfig,
 )
 
+# 语法错误检测模块（来自 grammer 子系统）
+_GRAMMER_ROOT = Path(__file__).resolve().parent / "grammer"
+if _GRAMMER_ROOT.exists() and str(_GRAMMER_ROOT) not in sys.path:
+    sys.path.insert(0, str(_GRAMMER_ROOT))
+
+try:
+    from train.phase3_build_engine_v2 import FastMedicalCorrectorV2
+    from inference.word_order_detector import WordOrderDetector
+    from train.phase2_mine_blacklist import contains_digit_or_english
+except Exception:
+    FastMedicalCorrectorV2 = None
+    WordOrderDetector = None
+    contains_digit_or_english = None
+
 # 导入 miss_ignore_pattern 用于结论缺失检测过滤
 miss_ignore_pattern = SystemConfig.miss_ignore_pattern()
 
 warnings.filterwarnings("ignore")
 jieba.load_userdict("config/user_dic_expand.txt")
+
+GRAMMAR_SENTENCE_PATTERN = re.compile(r'[。！？；，、：:;,.!?\n\r]+')
+_grammar_detector_instance = None
+
+
+def _split_into_sentences(text: str) -> List[tuple]:
+    if not text or not isinstance(text, str):
+        return []
+
+    sentences = []
+    start = 0
+    for match in GRAMMAR_SENTENCE_PATTERN.finditer(text):
+        end = match.start()
+        if end > start:
+            sentence = text[start:end].strip()
+            if sentence:
+                sentences.append((sentence, start, end))
+        start = match.end()
+
+    if start < len(text):
+        sentence = text[start:].strip()
+        if sentence:
+            sentences.append((sentence, start, len(text)))
+
+    return sentences
+
+
+def _find_error_context(text: str, error_start: int, error_end: int) -> str:
+    for sentence, sent_start, sent_end in _split_into_sentences(text):
+        if sent_start <= error_start < sent_end or sent_start < error_end <= sent_end:
+            return sentence
+    return text[error_start:error_end]
+
+
+def _is_sufficient_word_order_context(context: str, error_word: str) -> bool:
+    if not context:
+        return False
+    normalized_context = re.sub(r'\s+', '', context)
+    normalized_error = re.sub(r'\s+', '', error_word)
+    if normalized_context == normalized_error:
+        return False
+    if len(normalized_context) <= len(normalized_error) + 1:
+        return False
+    return True
+
+
+def _get_grammar_detector():
+    global _grammar_detector_instance
+    if _grammar_detector_instance is not None:
+        return _grammar_detector_instance
+
+    if FastMedicalCorrectorV2 is None or WordOrderDetector is None or contains_digit_or_english is None:
+        _grammar_detector_instance = False
+        return _grammar_detector_instance
+
+    try:
+        corrector = FastMedicalCorrectorV2()
+        engine_path = _GRAMMER_ROOT / "models" / "ac_automaton_v2.pkl"
+        if engine_path.exists():
+            corrector.load(str(engine_path))
+        else:
+            corrector.load_blacklists(
+                str(_GRAMMER_ROOT / "models" / "medical_confusion.txt"),
+                str(_GRAMMER_ROOT / "models" / "high_risk_general.txt"),
+            )
+            corrector.save(str(engine_path))
+
+        word_order_path = _GRAMMER_ROOT / "models" / "word_order_templates.json"
+        word_order_detector = WordOrderDetector(str(word_order_path)) if word_order_path.exists() else None
+
+        _grammar_detector_instance = {
+            "corrector": corrector,
+            "word_order_detector": word_order_detector,
+        }
+    except Exception:
+        _grammar_detector_instance = False
+
+    return _grammar_detector_instance
+
+
+def detect_grammer_errors(report_text: str, conclusion_text: str) -> List[Dict]:
+    detector = _get_grammar_detector()
+    if not detector:
+        return []
+
+    results = []
+    text_sources = [
+        ("ReportStr", report_text or ""),
+        ("ConclusionStr", conclusion_text or ""),
+    ]
+
+    for source_field, text in text_sources:
+        if not text.strip():
+            continue
+
+        # 1) typo / general_high_risk
+        for match in detector["corrector"].scan(text):
+            if contains_digit_or_english(match.error):
+                continue
+            if match.suggestion and contains_digit_or_english(match.suggestion):
+                continue
+
+            context = _find_error_context(text, match.position[0], match.position[1])
+            results.append({
+                "source_field": source_field,
+                "error_phrase": match.error,
+                "sentence": context,
+                "error_category": match.error_type,
+                "suggestion": match.suggestion,
+            })
+
+        # 2) word_order
+        word_order_detector = detector.get("word_order_detector")
+        if word_order_detector:
+            for e in word_order_detector.detect(text):
+                context = _find_error_context(text, e['position'][0], e['position'][1])
+                if not _is_sufficient_word_order_context(context, e['error']):
+                    continue
+                results.append({
+                    "source_field": source_field,
+                    "error_phrase": e['error'],
+                    "sentence": context,
+                    "error_category": "word_order",
+                    "suggestion": e.get('suggestion'),
+                })
+
+    # 去重
+    dedup = []
+    seen = set()
+    for item in results:
+        key = (
+            item.get("source_field"),
+            item.get("error_phrase"),
+            item.get("sentence"),
+            item.get("error_category"),
+            item.get("suggestion"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(item)
+    return dedup
+
 class Report(BaseModel):
     """报告医生的数据结构.<br>
     ConclusionStr：报告结论<br>
@@ -834,6 +993,7 @@ def Report_Quality(ReportTxt: Report, debug=False):
     none_standard_term = []
     apply_orient=''
     RADS=""
+    grammer_error = []
 
     # 检查漏写部位
     t0 = time.time()
@@ -927,6 +1087,11 @@ def Report_Quality(ReportTxt: Report, debug=False):
     Critical_value = CheckCritical(
         Conclusion_analyze, ReportStr_analyze, ReportTxt.modality)
 
+    # 语法错误（grammer 子系统）
+    t0 = time.time()
+    grammer_error = detect_grammer_errors(ReportTxt.ReportStr, ReportTxt.ConclusionStr)
+    timers['语法错误检查'] = time.time() - t0
+
     #检查RADS分类
     t0 = time.time()
     RADS=CheckRADS(ReportTxt.StudyPart, ReportTxt.ConclusionStr,ReportTxt.modality)
@@ -977,6 +1142,7 @@ def Report_Quality(ReportTxt: Report, debug=False):
         'RADS':RADS,#分类
         "Critical_value": Critical_value,#危急值
         "apply_orient":apply_orient,
+        "grammer_error": grammer_error, # 语法错误（错误短语/短句/类别）
         "_timers": timers,  # 内部性能统计
     }
 

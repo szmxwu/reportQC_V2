@@ -1,0 +1,140 @@
+## 输入：
+sentence="胃、十二指肠及所见肠曲：未见明显异常"
+modality="CT"
+
+
+## keyword_extraction.py 
+[{'ambiguity': False,
+  'axis': (106.0, 107.0),
+  'deny': True,
+  'ignore': False,
+  'illness': '曲未见明显异常',
+  'index': 0,
+  'measure': 0.0,
+  'orientation': '',
+  'partlist': ('腹部', '胃'),
+  'percent': 0.0,
+  'position': '胃',
+  'positive': False,
+  'primary': '胃、十二指肠及所见肠曲：未见明显异常',
+  'root': '腹部',
+  'start': 1,
+  'volume': 0.0,
+  'word_start': 1,
+  'words': '胃'},
+ {'ambiguity': False,
+  'axis': (106.0, 107.0),
+  'deny': True,
+  'ignore': False,
+  'illness': '曲未见明显异常',
+  'index': 1,
+  'measure': 0.0,
+  'orientation': '',
+  'partlist': ('腹部', '肠管', '小肠', '十二指肠'),
+  'percent': 0.0,
+  'position': '十二指肠',
+  'positive': False,
+  'primary': '胃、十二指肠及所见肠曲：未见明显异常',
+  'root': '腹部',
+  'start': 1,
+  'volume': 0.0,
+  'word_start': 3,
+  'words': '十二指肠'}]
+
+## Extract_Entities.py 
+[{'anchor': {'anchor_type': '',
+             'end': -1,
+             'keyword': '',
+             'sentence_index': -1,
+             'sentence_start': -1,
+             'start': -1,
+             'text': ''},
+  'attribute': ['other_description'],
+  'axis': [(106.0, 107.0)],
+  'end': 1,
+  'illness': '曲:未见明显异常',
+  'illness_end': 18,
+  'illness_start': 10,
+  'keyword': '胃',
+  'long_sentence': '胃、十二指肠及所见肠曲:未见明显异常',
+  'measure': 0.0,
+  'orientation': '',
+  'original_sentence': '胃、十二指肠及所见肠曲：未见明显异常',
+  'original_short_sentence': '胃，十二指肠及所见肠曲：未见明显异常',
+  'partlist': [('腹部', '胃')],
+  'percent': 0.0,
+  'position': '胃',
+  'positive': 0,
+  'sentence_index': 0,
+  'sentence_start': 0,
+  'short_sentence': '胃、十二指肠及所见肠曲:未见明显异常',
+  'start': 0,
+  'text_index': 0,
+  'volume': 0.0},
+ {'anchor': {'anchor_type': '',
+             'end': -1,
+             'keyword': '',
+             'sentence_index': -1,
+             'sentence_start': -1,
+             'start': -1,
+             'text': ''},
+  'attribute': ['other_description'],
+  'axis': [(106.0, 107.0)],
+  'end': 6,
+  'illness': '及所见',
+  'illness_end': 9,
+  'illness_start': 6,
+  'keyword': '十二指肠',
+  'long_sentence': '胃、十二指肠及所见肠曲:未见明显异常',
+  'measure': 0.0,
+  'orientation': '',
+  'original_sentence': '胃、十二指肠及所见肠曲：未见明显异常',
+  'original_short_sentence': '胃，十二指肠及所见肠曲：未见明显异常',
+  'partlist': [('腹部', '肠管', '小肠', '十二指肠')],
+  'percent': 0.0,
+  'position': '十二指肠',
+  'positive': 0,
+  'sentence_index': 0,
+  'sentence_start': 0,
+  'short_sentence': '胃、十二指肠及所见肠曲:未见明显异常',
+  'start': 2,
+  'text_index': 1,
+  'volume': 0.0}]
+
+
+  ## 输出比较：
+  ### 未改变的字段
+  - 输出是一个LIST，每个元素是一个解剖实体'position'和它的相关关系
+  - illness：病变描述
+  - measure：测量数值
+  - orientation：'position'的方位=[左，右，双]
+  - percent: 病变百分比数值
+  - volume: 体积数值
+  - position：代表被标准化后的器官名称，由'words'或'keyword'标准化而来
+
+  ### 改变的字段:
+  - positive：代表疾病的阳性/阴性。keyword_extraction.py 中的positive=[0,1], 而Extract_Entities.py 中的positive=[0,1,2,3], 你可以认为Extract_Entities.py的[0,1]等效于keyword_extraction.py中的0，大于1的均等效于1
+  - keyword_extraction.py 中的'primary'等于Extract_Entities.py 中的'original_short_sentence'，代表原始句子
+  - keyword_extraction.py 中的'words'等于Extract_Entities.py 中的'keyword'，代表器官关键词
+  
+  ### 关键改变结构
+  - partlist：代表器官名称被标准化后（position），在知识图谱中的绝对位置。keyword_extraction.py和Extract_Entities.py对待多义词的输出结构不同。
+    Extract_Entities.py用列表存放多种可能的partlist，例如：[('腹部', '肠管', '小肠'),('盆部', '肠管', '小肠')]
+    而keyword_extraction.py 用多条记录来存放多个可能的partlist，例如:
+        [{'position': "小肠",
+        'axis': ,
+        'deny': ,
+        'ignore': ,
+        'illness': ,
+        partlist:('腹部', '肠管', '小肠')},
+        {'position': "小肠",
+        'axis': ,
+        'deny': ,
+        'ignore': ,
+        'illness': ,
+        partlist:('盆腔', '肠管', '小肠')}]
+  - axis:每个partlist元素代表的人体坐标，与partlist严格对应。keyword_extraction.py和Extract_Entities.py对待多义词的输出结构差异和上述partlist相同
+    Extract_Entities.py用列表存放多种可能的axis， 而keyword_extraction.py 用多条记录来存放多个可能的axis
+
+
+

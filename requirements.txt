@@ -1,0 +1,27 @@
+# 放射学报告非医学高频词拦截引擎依赖
+
+# 拼音处理
+pypinyin>=0.50.0
+
+# KenLM N-gram 训练与查询
+kenlm>=0.2.0
+
+# AC 自动机多模式匹配
+pyahocorasick>=2.0.0
+
+# 中文纠错工具包（集成KenLM、拼音/字形混淆集）
+pycorrector>=1.1.0
+
+# 数据处理
+pandas>=2.0.0
+numpy>=1.24.0
+tqdm>=4.65.0
+
+# 中文分词
+jieba>=0.42.1
+
+# 文本编码检测
+chardet>=5.0.0
+
+# 可选加速
+numba>=0.58.0

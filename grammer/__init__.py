@@ -1,30 +1,30 @@
 """
-医学报告语法/错别字检测模块 v3.0 - Trigram增强版
+医学报告错别字检测引擎 v3.0
 
-分层架构：
-    1. 快速召回层：Trigram+Bigram+单字，高召回率
-    2. LLM精校层：多线程批量验证，高精度
+三策略检测：
+    1. 拼音混淆检测（分词后匹配，避免子串误报）
+    2. 高危通用词检测（纯中文）
+    3. 词序错误检测（高频可靠搭配）
 
-核心特性：
-    - Trigram检测：对医学固定搭配更可靠
-    - 多进程训练：充分利用CPU/GPU
-    - 多线程LLM：并发验证提高效率
+项目结构：
+    train/      - 训练相关脚本
+    inference/  - 推理/检测脚本
+    utils/      - 工具函数和配置
+    models/     - 预训练模型文件
+    output/     - 检测结果输出
 
 快速开始：
-    >>> from grammer import LayeredGrammarDetector
-    >>> detector = LayeredGrammarDetector(model_dir='grammer/models')
-    >>> errors = detector.detect("肺文里增粗", use_llm=True)
+    >>> from inference.medical_typo_detector import MedicalTypoDetector
+    >>> detector = MedicalTypoDetector()
+    >>> detector.load()
+    >>> errors = detector.detect("双肺文里增粗")
+    >>> print(errors)
+    [{'error': '文里', 'suggestion': '纹理', 'type': 'typo'}]
 """
 
-__version__ = '3.1.0'
+__version__ = '3.0.0'
 
-# 主要接口
-from .layered_grammar_detector import LayeredGrammarDetector, GrammarError
-from .fast_recover import FastRecoverDetector, SuspiciousFragment
+from inference.medical_typo_detector import MedicalTypoDetector
+from inference.word_order_detector import WordOrderDetector
 
-__all__ = [
-    'LayeredGrammarDetector',
-    'FastRecoverDetector', 
-    'GrammarError',
-    'SuspiciousFragment',
-]
+__all__ = ['MedicalTypoDetector', 'WordOrderDetector']

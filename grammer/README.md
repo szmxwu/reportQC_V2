@@ -1,427 +1,313 @@
-# 医学报告语法/错别字检测模块
+# 医学报告错别字检测引擎 v3.0
 
-基于分层架构的语法错误检测系统，专门针对医学影像报告优化。
+基于统计语料和拼音混淆的医学影像报告错别字自动检测系统。
 
-## 架构
-
-```
-文本输入
-    ↓
-┌───────────────────────────────┐
-│  第一层: 快速召回层            │
-│  ├── Trigram检测（3字组合）    │ ← 最可靠，优先
-│  ├── Bigram检测（2字组合）     │ ← 补充
-│  ├── 单字检测                  │ ← 最后
-│  └── 模式检测（重复/标点）      │
-└────────┬──────────────────────┘
-         ↓ 可疑片段列表
-┌───────────────────────────────┐
-│  第二层: LLM精校层             │
-│  ├── 批量验证（每批5个）        │
-│  ├── 多线程并发（默认8线程）     │
-│  └── 本地缓存                  │
-└────────┬──────────────────────┘
-         ↓
-    确认的语法错误
-```
-
-## 核心特点
-
-- **Trigram检测**: 对医学固定搭配更可靠（如"肺纹理"vs"肺文里"）
-- **实体感知短句验证**: 使用`Extract_Entities`拆分短句，只提供相关上下文给LLM，节省token
-- **高召回率**: 快速层>95%，宁可误报不可漏报
-- **高精度**: LLM层过滤后>85%精确率
-- **多线程优化**: 支持多进程训练、多线程LLM验证
-- **不依赖人工词典**: 从数据自动学习正常模式
-
-## 安装依赖
-
-```bash
-pip install pandas numpy tqdm openai
-
-# 可选（推荐安装以获得3-5倍加速）
-pip install numba psutil
-```
-
-## 配置
-
-从 `.env` 文件自动读取LLM配置：
-
-```bash
-# .env 文件示例
-LLM_BASE_URL=http://192.0.0.193:9997/v1
-LLM_MODEL=qwen3
-LLM_API_KEY=your-api-key
-LLM_TIMEOUT=30
-LLM_MAX_TOKENS=2048
-LLM_BATCH_SIZE=5
-LLM_CONFIDENCE_THRESHOLD=0.7
-USE_LLM_VALIDATION=true
-```
-
-配置项说明：
-
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `LLM_BASE_URL` | http://192.0.0.193:9997/v1 | LLM API地址 |
-| `LLM_MODEL` | qwen3 | 模型名称 |
-| `LLM_API_KEY` | - | API密钥（如果不需要可留空） |
-| `LLM_TIMEOUT` | 30 | 请求超时（秒） |
-| `LLM_MAX_TOKENS` | 2048 | 最大生成token数 |
-| `LLM_BATCH_SIZE` | 5 | 每批验证的片段数 |
-| `LLM_CONFIDENCE_THRESHOLD` | 0.7 | LLM置信度阈值 |
-| `USE_LLM_VALIDATION` | true | 是否启用LLM验证 |
-
-## 快速开始
-
-### 1. 训练模型
-
-```bash
-# 基础训练（单进程，适合测试）
-python grammer/train_optimized.py --max-texts 10000
-
-# 推荐训练（多进程+JIT加速，适合生产）
-python grammer/train_optimized.py \
-    --workers 5 \
-    --io-workers 4 \
-    --use-trigram \
-    --use-jit
-
-# 完整训练（360万条报告）
-python grammer/train_optimized.py \
-    --data-dir ~/work/python/Radiology_Entities/radiology_data \
-    --output grammer/models \
-    --workers 5 \
-    --io-workers 4 \
-    --chunk-size 100000 \
-    --use-trigram \
-    --use-jit
-```
-
-**训练参数说明**:
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--workers` | 5 | 处理进程数（建议CPU核心数-1） |
-| `--io-workers` | 4 | Excel读取线程数 |
-| `--chunk-size` | 100000 | 每批处理条数（内存越大可越大） |
-| `--use-trigram` | True | 启用trigram检测 |
-| `--use-jit` | True | 启用Numba JIT加速 |
-| `--max-texts` | None | 最大训练样本数（测试用） |
-
-**训练输出**:
-```
-grammer/models/
-├── char_anomaly.pkl    # 字符统计模型
-├── entropy.pkl         # 上下文熵模型
-└── stats.json          # 训练统计
-```
-
-### 2. 检测文本
-
-```python
-from grammer import LayeredGrammarDetector
-
-# 加载模型
-detector = LayeredGrammarDetector(
-    model_dir='grammer/models',
-    llm_workers=8  # LLM并发线程数
-)
-
-# 方式1: 仅快速召回（快，可能有误报）
-suspicious = detector.fast_detect("双肺文里增粗")
-for frag in suspicious:
-    print(f"可疑: {frag.text} [{frag.strategy}] 分数:{frag.score:.2f}")
-
-# 方式2: 完整检测（准，含LLM验证）
-errors = detector.detect("双肺文里增粗", use_llm=True)
-for err in errors:
-    print(f"错误: {err.text} -> {err.suggestion}")
-```
-
-### 3. 批量检测所有训练样本
-
-使用 `batch_detect.py` 脚本遍历所有训练样本，输出JSONL格式的错误报告：
-
-```bash
-# 基础用法（检测所有360万条样本）
-python grammer/batch_detect.py --output grammer/errors.jsonl
-
-# 限制样本数（测试）
-python grammer/batch_detect.py --max-samples 1000 --output grammer/errors_test.jsonl
-
-# 不使用LLM（仅启发式规则，更快）
-python grammer/batch_detect.py --no-llm --output grammer/errors.jsonl
-
-# 不包含完整报告文本（减小输出文件大小）
-python grammer/batch_detect.py --no-full-text --output grammer/errors.jsonl
-
-# 多进程加速（4进程）
-python grammer/batch_detect.py --workers 4 --output grammer/errors.jsonl
-```
-
-**输出字段说明**：
-
-```json
-{
-  "report_id": 12345,              // 报告ID
-  "error_phrase": "文里",          // 错误短语（定位字段1）
-  "sentence": "双肺文里增粗",       // 所在句子（定位字段2）
-  "suggestion": "纹理",            // 建议修正
-  "error_type": "错别字",          // 错误类型
-  "confidence": 0.95,              // 置信度
-  "position": {"start": 2, "end": 4},  // 在报告中的位置
-  "llm_verified": true,            // 是否LLM验证
-  "detected_by": "layered_detector",  // 检测策略
-  "source_file": "all_data_match_HIS_data_part001.xlsx",  // 来源文件
-  "report_text": "双肺文里增粗..."  // 完整报告文本（可选）
-}
-```
-
-**输出统计**：脚本会同时生成 `.stats.json` 文件，包含错误类型分布等信息。
-
-## 完整API
-
-### LayeredGrammarDetector
-
-```python
-detector = LayeredGrammarDetector(
-    model_dir='grammer/models',      # 模型目录
-    llm_client=None,                  # LLM客户端（可选，默认从.env创建）
-    llm_workers=8,                    # LLM并发线程数
-    use_trigram=True                  # 是否使用trigram
-)
-
-# 快速召回（Trigram+Bigram+模式检测）
-suspicious = detector.fast_detect(text: str) -> List[SuspiciousFragment]
-
-# 完整检测（同步）- 包含实体感知短句LLM验证
-errors = detector.detect(text: str, use_llm: bool = True) -> List[GrammarError]
-
-# 完整检测（异步）
-errors = await detector.detect_async(text: str) -> List[GrammarError]
-
-# 批量检测（同步）
-results = detector.detect_batch(texts: List[str], use_llm: bool) -> List[List[GrammarError]]
-
-# 批量检测（异步）
-results = await detector.detect_batch_async(texts: List[str]) -> List[List[GrammarError]]
-
-# 获取统计
-stats = detector.get_stats()
-```
-
-### 实体感知验证流程
-
-```python
-from grammer import LayeredGrammarDetector
-from grammer.layered_grammar_detector import SentenceSplitter
-
-# 1. 拆分短句（基于实体）
-splitter = SentenceSplitter()
-sentences = splitter.split("双肺纹理增粗，见多发结节影。")
-# 结果: ['双肺纹理增粗', '见多发结节影']
-
-# 2. 检测可疑片段
-# （内部自动将可疑片段映射到对应短句）
-
-# 3. LLM只验证相关短句
-# （节省token，提高准确率）
-```
-
-### 检测结果
-
-```python
-# SuspiciousFragment（可疑片段）
-{
-    'text': '肺文里',           # 可疑文本
-    'position': (2, 5),         # 在原文中的位置
-    'strategy': 'trigram_rarity', # 检测策略
-    'score': 0.95,              # 可疑分数(0-1)
-    'context': '双肺文里增粗',   # 上下文
-    'reason': '罕见三字组合'     # 判定理由
-}
-
-# GrammarError（确认错误）
-{
-    'text': '肺文里',
-    'position': (2, 5),
-    'suggestion': '肺纹理',      # 建议修正
-    'error_type': '错别字',      # 错误类型
-    'confidence': 0.95,          # 置信度
-    'reason': '匹配常见错别字库',
-    'llm_verified': False        # 是否LLM验证
-}
-```
-
-## 性能优化
-
-### 硬件配置建议
-
-- **CPU**: 多核（训练用）
-- **内存**: 16GB+（推荐32GB）
-- **存储**: SSD（Excel读取是IO密集型）
-- **GPU**: 可选（字符统计任务GPU收益有限）
-
-### 针对6核32G配置的推荐参数
-
-```bash
-python grammer/train_optimized.py \
-    --workers 5 \           # 6核留1核给系统
-    --io-workers 4 \        # 4线程读Excel
-    --chunk-size 100000 \   # 32G内存支持大缓冲区
-    --use-trigram \         # 启用trigram
-    --use-jit               # Numba JIT加速
-```
-
-**预期性能**:
-- 读取速度: ~50000 条/秒（4线程IO）
-- 处理速度: ~30000 条/秒（5进程+JIT）
-- 总训练时间: ~6-8分钟（360万条）
-- 内存峰值: ~8-12GB
-
-## Trigram vs Bigram
-
-Trigram（3字组合）对医学文本更可靠：
-
-| 文本 | Bigram检测 | Trigram检测 |
-|------|-----------|-------------|
-| 肺纹理增粗 | "肺纹"常见 | "肺纹理"常见 ✓ |
-| 肺文里增粗 | "肺文"可疑 | "肺文里"可疑 ✓ |
-
-**优势**:
-- 医学术语多为固定3字搭配
-- 能精确定位中间字错误
-- 上下文更丰富，假阳性更低
-
-运行对比测试:
-```bash
-python grammer/test_trigram.py
-```
-
-## 实体感知短句验证（LLM优化）
-
-### 问题
-传统方法将整段文本送入LLM，导致：
-- Token消耗过大
-- 上下文过长，LLM容易分心
-- 响应速度慢
-
-### 解决方案
-使用`Extract_Entities.py`的`text_extrac_process`函数，基于实体位置智能拆分短句：
-
-```
-原文: "双肺纹理增粗，见多发结节影。边界清晰，建议随访。"
-        ↓ text_extrac_process
-短句1: "双肺纹理增粗" (包含实体"肺纹理")
-短句2: "见多发结节影" (包含实体"结节")
-短句3: "边界清晰" (独立短句)
-短句4: "建议随访" (独立短句)
-```
-
-### LLM Prompt设计
-
-只提供可疑片段所在的短句，而非整段文本：
-
-```
-你是一位医学报告编辑专家。请判断以下医学影像报告短句中
-标记的可疑片段是否存在语法错误或错别字。
-
-【判断标准】
-1. 是否存在错别字？
-2. 是否存在语法不通顺？
-3. 是否是医学专业术语？
-
-【片段1】双【肺文里】增粗
-  检测策略: trigram_rarity, 可疑分数: 0.95
-
-【片段2】见【低密渡】影
-  检测策略: trigram_rarity, 可疑分数: 0.88
-
-请以JSON格式输出判断结果...
-```
-
-### 优势
-
-| 指标 | 整段文本 | 实体感知短句 |
-|------|---------|-------------|
-| Token消耗 | 500-1000 | 100-200 |
-| 响应速度 | 2-3秒 | 0.5-1秒 |
-| 准确率 | 中等 | 高（上下文聚焦） |
-| 成本 | 高 | 低（节省60-80%） |
-
-## 基准测试
-
-```bash
-# 运行性能测试
-python grammer/benchmark.py --full
-
-# 预期输出:
-# - 硬件配置检测
-# - 内存使用估计
-# - 推荐配置
-# - 字符提取性能对比
-# - N-gram统计性能
-```
-
-## 常见问题
-
-### Q: 训练时内存不足？
-
-```bash
-# 降低块大小
-python grammer/train_optimized.py --chunk-size 30000
-
-# 减少进程数
-python grammer/train_optimized.py --workers 3
-```
-
-### Q: Numba JIT报错？
-
-```bash
-# 禁用JIT回退到纯Python
-python grammer/train_optimized.py --no-jit
-```
-
-### Q: 如何验证训练成功？
-
-```bash
-# 检查输出文件
-ls -lh grammer/models/
-
-# 运行测试
-python -c "
-from grammer import LayeredGrammarDetector
-d = LayeredGrammarDetector('grammer/models')
-errors = d.detect('肺文里增粗')
-print(f'检测成功: {len(errors)}个错误')
-"
-```
-
-## 文件结构
+## 项目结构
 
 ```
 grammer/
-├── __init__.py                    # 模块入口
-├── README.md                      # 本文档
-├── layered_grammar_detector.py    # 主检测器（分层架构）
-├── fast_recover.py                # 快速召回层（Trigram）
-├── train_optimized.py             # 优化训练脚本
-├── typo_database.py               # 常见错别字库（备用）
-├── benchmark.py                   # 性能测试工具
-├── test_trigram.py                # Trigram对比测试
-├── load_data.py                   # 数据加载（用户提供）
-└── models/                        # 训练输出（生成）
-    ├── char_anomaly.pkl
-    ├── entropy.pkl
-    └── stats.json
+├── train/                      # 训练脚本
+│   ├── phase1_train_kenlm.py      # Phase 1: KenLM训练 + 词频统计
+│   ├── phase2_mine_blacklist.py   # Phase 2: 拼音混淆/高危词挖掘
+│   ├── phase3_build_engine_v2.py  # Phase 3: AC自动机引擎构建
+│   ├── extract_word_order_templates.py  # 词序模板提取
+│   ├── build_substring_vocab.py     # 子串频次表构建
+│   └── ssd_processor.py            # SSD流式处理器
+├── inference/                  # 推理脚本
+│   ├── detect_real_data_final.py   # 真实数据检测（主入口）
+│   ├── medical_typo_detector.py    # 统一检测接口
+│   └── word_order_detector.py      # 词序错误检测器
+├── utils/                      # 工具模块
+│   ├── config.py                   # 配置管理
+│   └── utils.py                    # 工具函数
+├── models/                     # 模型文件（生成）
+│   ├── radiology_vocab.json        # 放射语料词频
+│   ├── radiology_ngram.klm         # KenLM模型
+│   ├── medical_confusion.txt       # 拼音混淆对
+│   ├── high_risk_general.txt       # 高危通用词
+│   ├── word_order_templates.json   # 词序错误模板
+│   └── ac_automaton_v2.pkl         # AC自动机引擎
+├── output/                     # 检测结果输出
+├── huqie.txt                   # 通用词表（中文分词词典）
+├── requirements.txt            # 依赖列表
+└── README.md                   # 本文档
 ```
 
-## 版本
+## 核心算法
 
-v3.1.0 - Trigram增强版
+### 1. 拼音混淆检测（策略A）
 
-- 支持Trigram检测
-- 多进程训练优化
-- 多线程LLM验证
-- Numba JIT加速
+**问题**：医学报告中常见的拼音输入错误，如 "纹理" 误写为 "文里"。
+
+**算法**：多层次拼音混淆挖掘
+
+#### Level 1: 单字同音替换
+基于同音字字典，对正确词的每个字符进行替换：
+```python
+"纹理" (wen li)
+  ↓ 替换"纹"→"文"
+"文理" - 候选
+  ↓ 替换"理"→"里"  
+"文里" - 有效混淆对
+```
+
+#### Level 2: 双字组合替换
+处理需要同时替换两个字的复杂情况：
+```python
+"胆囊" (dan nang)
+  ↓ 同时替换"胆"→"但", "囊"→"?
+"但囊" - 有效混淆对
+```
+
+**关键修复**：
+- 原`[:3]`限制导致常用同音字被遗漏 → 扩大到`[:20]`
+- `max_combinations=50`导致提前返回 → 增加到200
+
+#### Level 3: 医学术语锚点扩展
+对医学词典中的高频术语进行深度扩展：
+- 扫描医学术语（如"椎间盘"、"肺气肿"）
+- 生成单字+双字混淆变体
+- 基于分词词频表过滤（错误词频次<50）
+
+**过滤条件**：
+1. 错误词频次 < 50（分词后）
+2. 正确词频次 > 100
+3. 拼音编辑距离 <= 2
+4. **不包含数字/英文**（纯中文）
+5. 不在医学保护词典中
+
+### 2. 高危通用词检测（策略B）
+
+**问题**：报告混入通用专有名词（地名、机构名、人名），如 "阿里巴巴"。
+
+**算法**：频反差异常检测
+
+```
+风险分 = log(通用频次) / log(放射频次 + 2) × 词性权重 × 医学保护权重
+
+判定条件：
+- 通用词频次 > 1
+- 放射语料频次 < 10
+- 风险分 > 2.0
+```
+
+**示例**：
+| 词语 | 通用频次 | 放射频次 | 风险分 | 判定 |
+|------|----------|----------|--------|------|
+| 阿里巴巴 | 高 | 极低 | 9.6 | ✅ 高危 |
+| 马化腾 | 高 | 极低 | 8.2 | ✅ 高危 |
+| 纹理 | 中 | 高 | 0.3 | ❌ 正常 |
+
+### 3. 词序错误检测（策略C）
+
+**问题**：词语顺序错误，如 "异常未见" 应为 "未见异常"。
+
+**算法**：高频bigram统计 + 保守策略
+
+```python
+提取条件（同时满足）：
+1. 正序搭配频次 > 100（确保是高频固定搭配）
+2. 反序搭配频次 < 5（确保反向几乎不出现）
+3. 正序/反序比值 > 100倍（显著差异）
+```
+
+**典型检测**：
+| 错误 | 正确 | 正序频次 | 反序频次 | 差异倍数 |
+|------|------|----------|----------|----------|
+| 异常未见 | 未见异常 | 414万 | 0 | ∞ |
+| 扫描增强 | 增强扫描 | 46万 | 0 | ∞ |
+| 增生骨质 | 骨质增生 | 51万 | 0 | ∞ |
+
+### 4. 子串误报问题解决
+
+**原始问题**：AC自动机做子串匹配导致误报
+```
+原文: "左肺上叶前段胸膜下见一微小结节"
+误报: "见一" -> "建议" （匹配了"下见一"中的子串）
+```
+
+**解决方案**：分词后匹配
+
+```python
+def scan(text):
+    words = jieba.cut(text)  # 先分词
+    for word in words:
+        if word in confusion_pairs:  # 只在分词边界匹配
+            report_error()
+        # 连续单字组合检测（如"扫"+"瞄"="扫瞄"）
+        if is_consecutive_single_chars(words):
+            combined = combine_chars()
+            if combined in confusion_pairs:
+                report_error()
+```
+
+**效果**：
+- ✅ "见一" 不再误报（jieba分词为["下见", "一"]）
+- ✅ "扫瞄" 正确检测（["扫", "瞄"]组合）
+
+## 训练流程
+
+### Phase 1: KenLM训练 + 词频统计
+
+```bash
+cd train
+python3 phase1_train_kenlm.py --data /path/to/radiology_data.xlsx
+```
+
+**输出**：
+- `models/radiology_corpus.txt` - 分词语料
+- `models/radiology_vocab.json` - 词频统计
+- `models/radiology_ngram.klm` - KenLM模型
+
+**技术**：SSD流式处理（时间换空间），支持亿级语料
+
+### Phase 2: 黑名单挖掘
+
+```bash
+python3 phase2_mine_blacklist.py
+```
+
+**输出**：
+- `models/medical_confusion.txt` - 拼音混淆对（约90万对）
+- `models/high_risk_general.txt` - 高危通用词（约27万个）
+
+**算法细节**：
+- 使用pycorrector的same_pinyin.txt作为同音字字典
+- 拼音编辑距离计算（动态规划）
+- 双重过滤：分词频次 + 数字/英文过滤
+
+### Phase 3: AC自动机引擎构建
+
+```bash
+python3 phase3_build_engine_v2.py
+```
+
+**输出**：
+- `models/ac_automaton_v2.pkl` - 序列化引擎
+
+**技术**：pyahocorasick实现O(N)多模式匹配
+
+### 词序模板提取（可选）
+
+```bash
+python3 extract_word_order_templates.py
+```
+
+**输出**：
+- `models/word_order_templates.json` - 374个高频词序模式
+
+## 推理使用
+
+### 快速检测
+
+```bash
+cd inference
+python3 detect_real_data_final.py --sample --limit 100
+```
+
+**参数**：
+- `--sample` - 使用示例数据
+- `--limit N` - 只检测前N条
+- `-c 描述 结论` - 指定检测列
+
+**输出**：`output/detect_results_*.json`
+
+```json
+{
+  "report_id": "CT1808030005",
+  "column": "描述",
+  "text": "双肺文里增粗...",
+  "errors": [
+    {
+      "error": "文里",
+      "suggestion": "纹理",
+      "type": "typo",
+      "context": "双肺文里增粗"
+    }
+  ]
+}
+```
+
+### Python API
+
+```python
+from inference.medical_typo_detector import MedicalTypoDetector
+
+detector = MedicalTypoDetector()
+detector.load()
+
+# 检测文本
+errors = detector.detect("双肺文里增粗，异常未见")
+for err in errors:
+    print(f"[{err['type']}] {err['error']} -> {err['suggestion']}")
+    print(f"  上下文: {err['context']}")
+
+# 输出：
+# [typo] 文里 -> 纹理
+#   上下文: 双肺文里增粗
+# [word_order] 异常未见 -> 未见异常
+#   上下文: 异常未见
+```
+
+## 性能指标
+
+| 指标 | 数值 |
+|------|------|
+| 拼音混淆对 | 908,499对 |
+| 高危通用词 | 271,591个 |
+| 词序检测模式 | 374个 |
+| **总检测能力** | **1,180,464** |
+| 检测速度 | ~130条/秒 |
+| 假阳性率 | <5%（分词后匹配） |
+
+## 关键参数配置
+
+编辑 `utils/config.py`：
+
+```python
+# 策略A：拼音混淆
+MIN_RADIO_FREQ = 100          # 正确词最小频次
+MAX_VARIANT_FREQ = 50         # 错误词最大频次
+MAX_PINYIN_DISTANCE = 2       # 最大拼音编辑距离
+
+# 策略B：高危通用词
+RISK_THRESHOLD = 2.0          # 风险判定阈值
+MAX_RADIO_FREQ = 10           # 放射语料最大安全频次
+
+# 策略C：词序错误
+MIN_FREQ = 100                # 正确搭配最小频次
+MAX_WRONG_FREQ = 5            # 错误搭配最大频次
+```
+
+## 依赖安装
+
+```bash
+pip install -r requirements.txt
+```
+
+**核心依赖**：
+- pypinyin - 拼音转换
+- pyahocorasick - AC自动机
+- pycorrector - 同音字/形似字字典
+- jieba - 中文分词
+- pandas - Excel数据处理
+- kenlm - N-gram语言模型（可选）
+
+## 算法优势
+
+1. **低假阳性**：分词后匹配避免子串误报
+2. **高召回率**：90万+混淆对覆盖常见拼音错误
+3. **纯中文**：过滤数字/英文，专注语法错误
+4. **可解释**：基于真实语料统计，非黑盒
+5. **可增量**：支持随时添加新的混淆对
+
+## 版本历史
+
+- **v3.0** (当前)：项目重构，分离训练/推理，添加分词后匹配
+- **v2.1**：新增词序错误检测，374个高频搭配
+- **v2.0**：双策略检测（拼音混淆 + 高危通用词）
+- **v1.0**：基础AC自动机实现
+
+## 许可
+
+MIT License

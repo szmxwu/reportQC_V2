@@ -135,6 +135,19 @@ class QualityCheckResponse(BaseModel):
     RADS: str = Field(description="RADS分类检查")
     Critical_value: List[dict] = Field(description="危急值列表")
     apply_orient: str = Field(description="申请单位方位错误")
+    grammer_error: List[dict] = Field(
+        default_factory=list,
+        description="语法错误检测结果（错误短语、所在短句、错误类别）",
+        example=[
+            {
+                "source_field": "ReportStr",
+                "error_phrase": "线装",
+                "sentence": "心尖段前壁及间隔壁可见内膜下线装异常灌注缺损",
+                "error_category": "typo",
+                "suggestion": "线状"
+            }
+        ]
+    )
     
     # 元数据
     processing_time: Optional[float] = Field(

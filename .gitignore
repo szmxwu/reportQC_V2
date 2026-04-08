@@ -186,7 +186,7 @@ all_data_match*
 radiology_classifier*
 *.db*
 output/*
-*.txt
+huqie.txt
 .env
 *.zip
 plan.md
@@ -208,3 +208,5 @@ __pycache__
 .vscode
 origin/**.pkl
 AGENTS.md
+output
+test

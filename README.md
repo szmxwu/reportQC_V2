@@ -1,9 +1,23 @@
 # 医学影像报告智能质控系统
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-CC--BY--NC%204.0-lightblue.svg)](LICENSE)
 
 基于自然语言处理（NLP）技术的医学影像报告质量控制系统，支持 CT、MR、DR、DX、MG 等多种影像模态的自动质控检测。
+
+## 目录
+
+- [功能特性](#功能特性)
+- [技术亮点](#技术亮点)
+- [快速开始](#快速开始)
+- [使用示例](#使用示例)
+- [语法错误检测（Grammar Detection）](#语法错误检测grammar-detection)
+- [项目结构](#项目结构)
+- [配置说明](#配置说明)
+- [性能表现](#性能表现)
+- [贡献指南](#贡献指南)
+- [许可证](#许可证)
+
 
 ## 功能特性
 
@@ -22,6 +36,7 @@
 | 📊 **RADS 分类** | 检查 BI-RADS/PI-RADS 分类 |
 | ⚠️ **语言矛盾** | 检测同一部位的阴阳性矛盾 |
 | 📋 **申请单校验** | 验证报告与申请单部位方位一致性 |
+| 📚 **语法错误检测** | 自动检测拼写/语法类错误与医学术语混淆（集成 LLM 可选精筛） |
 
 ### 技术亮点
 
@@ -121,6 +136,25 @@ python3 api_server.py
 - `GET /api/v1/config` - 查看配置
 - `GET /docs` - Swagger 文档
 
+## 语法错误检测（Grammar Detection）
+
+本项目包含一个独立的语法/拼写与医学术语混淆检测模块，位于 `grammer/` 目录，主要用途是发现报告中的拼写、用词或短语级别的医学术语混淆（例如“起腔” vs “气腔”）。主要要点：
+
+- 模块位置：`grammer/`，推理脚本：`grammer/inference/detect_real_data_final.py`。
+- 集成：已将语法检测器以懒加载方式集成到主入口 `NLP_analyze.Report_Quality()`，返回字段名为 `grammer_error`（列表），每项包含：错误短语、所在句子、错误类别、来源字段（描述/结论/申请单）及建议。
+- 输出格式：批量推理输出包含 `metadata.performance`（性能统计）与按句子聚合的 `text` 字段；`grammer_error` 出现在单条或批量质控输出中。
+- 独立运行示例：
+
+```bash
+# 对单条样例运行主质控（包含语法检测）
+python3 NLP_analyze.py
+
+# 运行语法检测独立推理（示例）
+cd grammer && python3 inference/detect_real_data_final.py --sample --limit 100 -o ../output/detect_results_sample.json
+```
+
+在使用 API 时，`POST /api/v1/report/quality` 和批量接口 `POST /api/v1/report/batch_quality` 的返回 JSON 中会包含 `grammer_error` 字段（可能为空列表），Swagger 示例也已更新以展示该字段。
+
 ## 项目结构
 
 ```
@@ -182,7 +216,7 @@ LLM验证统计:
 ============================================================
 ```
 
-> 注：性能取决于是否启用 LLM 验证。纯规则引擎模式下吞吐量可达 5+ 条/秒。
+> 注：性能取决于是否启用 LLM 验证。纯规则引擎模式下吞吐量可达 50+ 条/秒。
 
 ## 算法原理
 
@@ -212,7 +246,7 @@ LLM验证统计:
 
 ## 许可证
 
-本项目基于 MIT 许可证开源 - 详见 [LICENSE](LICENSE) 文件
+本项目采用 Creative Commons Attribution-NonCommercial 4.0 国际 (CC BY-NC 4.0) 许可证，允许学术研究与教学共享，但禁止商业用途。详见 [LICENSE](LICENSE) 文件。如需商业使用，请联系项目维护者以获取授权。
 
 ## 致谢
 
