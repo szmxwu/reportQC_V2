@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ValidationResult",
+  "type": "object",
+  "required": ["candidate_text", "validation_level"],
+  "properties": {
+    "candidate_text": {"type": "string"},
+    "validation_level": {
+      "type": "string",
+      "enum": ["A", "B", "C"]
+    },
+    "validation_reasons": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "downstream_gain": {"type": ["number", "null"]},
+    "conflict_with_existing_mapping": {"type": ["boolean", "null"]}
+  }
+}

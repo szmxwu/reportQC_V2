@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EntityCandidate",
+  "type": "object",
+  "required": ["candidate_text", "sentence", "modality", "StudyPart"],
+  "properties": {
+    "hospital_id": {"type": ["string", "null"]},
+    "report_id": {"type": ["string", "null"]},
+    "sentence": {"type": "string"},
+    "candidate_text": {"type": "string"},
+    "context_before": {"type": ["string", "null"]},
+    "context_after": {"type": ["string", "null"]},
+    "StudyPart": {"type": "string"},
+    "modality": {"type": "string"},
+    "matched_by_rule": {"type": ["boolean", "null"]},
+    "current_partlist": {"type": ["array", "null"]},
+    "candidate_type": {"type": ["string", "null"]},
+    "frequency_local": {"type": ["number", "null"]},
+    "frequency_global": {"type": ["number", "null"]}
+  }
+}

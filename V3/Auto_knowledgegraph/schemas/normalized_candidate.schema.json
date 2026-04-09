@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NormalizedCandidate",
+  "type": "object",
+  "required": ["candidate_text", "top_candidates", "is_possible_new_node"],
+  "properties": {
+    "candidate_text": {"type": "string"},
+    "top_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "candidate_node_id": {"type": ["string", "null"]},
+          "candidate_node_path": {"type": ["array", "null"]},
+          "score": {"type": ["number", "null"]},
+          "reason": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "is_alias_of_existing_node": {"type": ["boolean", "null"]},
+    "is_possible_new_node": {"type": "boolean"},
+    "normalization_status": {"type": ["string", "null"]}
+  }
+}

@@ -1,0 +1,1 @@
+"""Auto KnowledgeGraph project package."""
