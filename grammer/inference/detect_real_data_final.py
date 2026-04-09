@@ -9,13 +9,17 @@ import json
 import re
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 import jieba
 import pandas as pd
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+GRAMMER_ROOT = Path(__file__).resolve().parent.parent
+MODELS_DIR = GRAMMER_ROOT / 'models'
 
 from train.phase3_build_engine_v2 import FastMedicalCorrectorV2
 from inference.word_order_detector import WordOrderDetector
@@ -88,30 +92,35 @@ class MedicalTypoDetectorFinal:
         self.word_order_detector = None
         self.lm_model = None
         self.typo_lm_reject_delta = 0.30
+        self.expand_min_suggest_freq = 50
+        self.expand_accept_delta = 0.20
         self._lm_score_cache = {}
+        self.char_subst_map = {}
+        self.radiology_vocab_freq = {}
+        self.candidate_lexicon = {}
     
     def load(self):
         """加载引擎"""
         # 加载拼音/高危词检测器
         self.corrector = FastMedicalCorrectorV2()
         
-        engine_path = 'models/ac_automaton_v2.pkl'
-        if Path(engine_path).exists():
-            self.corrector.load(engine_path)
+        engine_path = MODELS_DIR / 'ac_automaton_v2.pkl'
+        if engine_path.exists():
+            self.corrector.load(str(engine_path))
         else:
             self.corrector.load_blacklists(
-                'models/medical_confusion.txt',
-                'models/high_risk_general.txt'
+                str(MODELS_DIR / 'medical_confusion.txt'),
+                str(MODELS_DIR / 'high_risk_general.txt')
             )
-            self.corrector.save(engine_path)
+            self.corrector.save(str(engine_path))
         
         # 加载词序检测器
-        word_order_path = 'models/word_order_templates.json'
-        if Path(word_order_path).exists():
-            self.word_order_detector = WordOrderDetector(word_order_path)
+        word_order_path = MODELS_DIR / 'word_order_templates.json'
+        if word_order_path.exists():
+            self.word_order_detector = WordOrderDetector(str(word_order_path))
 
         # 加载 KenLM 语言模型（可选）
-        lm_path = Path('models/radiology_ngram.klm')
+        lm_path = MODELS_DIR / 'radiology_ngram.klm'
         try:
             import kenlm
             if lm_path.exists():
@@ -121,6 +130,26 @@ class MedicalTypoDetectorFinal:
                 print(f"KenLM 模型不存在，跳过上下文校验: {lm_path}")
         except Exception as e:
             print(f"KenLM 加载失败，跳过上下文校验: {e}")
+
+        # 构建候选扩展所需资源（可选）
+        self.char_subst_map = self._build_char_subst_map(self.corrector.confusion_pairs)
+        vocab_path = MODELS_DIR / 'radiology_vocab.json'
+        try:
+            if vocab_path.exists():
+                with open(vocab_path, 'r', encoding='utf-8') as f:
+                    vocab_data = json.load(f)
+                self.radiology_vocab_freq = vocab_data.get('word_freq', {})
+        except Exception as e:
+            print(f"词频表加载失败，候选扩展将降级: {e}")
+
+        candidates_path = MODELS_DIR / 'expanded_candidates.json'
+        try:
+            if candidates_path.exists():
+                with open(candidates_path, 'r', encoding='utf-8') as f:
+                    candidate_data = json.load(f)
+                self.candidate_lexicon = candidate_data.get('candidates', {})
+        except Exception as e:
+            print(f"离线候选词库加载失败，将回退到动态生成: {e}")
         
         print("检测器加载完成")
 
@@ -160,6 +189,84 @@ class MedicalTypoDetectorFinal:
             tokens.append((word, start, end))
             search_start = end
         return tokens
+
+    @staticmethod
+    def _is_chinese_token(token: str) -> bool:
+        if not token:
+            return False
+        return all('\u4e00' <= c <= '\u9fff' for c in token)
+
+    @staticmethod
+    def _build_char_subst_map(confusion_pairs: Dict[str, str]) -> Dict[str, set]:
+        """从现有混淆对构建单字替换映射（仅保留等长且单字差异）。"""
+        mapping = defaultdict(set)
+        for wrong, correct in confusion_pairs.items():
+            if len(wrong) != len(correct):
+                continue
+            diff_positions = [i for i, (a, b) in enumerate(zip(wrong, correct)) if a != b]
+            if len(diff_positions) != 1:
+                continue
+            i = diff_positions[0]
+            mapping[wrong[i]].add(correct[i])
+        return dict(mapping)
+
+    def _generate_expanded_candidates(self, token: str) -> List[str]:
+        """基于单字替换映射生成候选词。"""
+        if token in self.candidate_lexicon:
+            items = sorted(
+                self.candidate_lexicon[token],
+                key=lambda x: (x.get('offline_score', 0.0), x.get('correct_freq', 0)),
+                reverse=True,
+            )
+            return [item.get('suggestion') for item in items if item.get('suggestion')]
+
+        candidates = set()
+        if not self.char_subst_map:
+            return []
+
+        for i, ch in enumerate(token):
+            replacements = self.char_subst_map.get(ch)
+            if not replacements:
+                continue
+            for rep in replacements:
+                cand = token[:i] + rep + token[i + 1:]
+                if cand == token:
+                    continue
+                if self.radiology_vocab_freq.get(cand, 0) < self.expand_min_suggest_freq:
+                    continue
+                candidates.add(cand)
+
+        return list(candidates)
+
+    def _select_best_expanded_candidate(self, text: str, token: str, start: int, end: int) -> str:
+        """用 KenLM 选择最优候选；仅当候选上下文显著优于原词时接受。"""
+        if not self.lm_model:
+            return ''
+
+        prev_word, next_word = self._get_prev_next_word(text, start, end)
+        if not prev_word and not next_word:
+            return ''
+
+        candidates = self._generate_expanded_candidates(token)
+        if not candidates:
+            return ''
+
+        original_context = f"{prev_word}{token}{next_word}"
+        original_score = self._kenlm_score(original_context)
+
+        best_cand = ''
+        best_delta = 0.0
+        for cand in candidates:
+            corrected_context = f"{prev_word}{cand}{next_word}"
+            corrected_score = self._kenlm_score(corrected_context)
+            delta = corrected_score - original_score
+            if delta > best_delta:
+                best_delta = delta
+                best_cand = cand
+
+        if best_cand and best_delta >= self.expand_accept_delta:
+            return best_cand
+        return ''
 
     def _get_prev_next_word(self, text: str, start: int, end: int) -> Tuple[str, str]:
         tokens = self._tokenize_with_positions(text)
@@ -213,6 +320,7 @@ class MedicalTypoDetectorFinal:
         
         # 1. 拼音/高危词检测（分词后匹配）
         if self.corrector:
+            matched_spans = set()
             matches = self.corrector.scan(text)
             for m in matches:
                 # 过滤包含数字或英文的错误（只关注纯中文错误）
@@ -239,6 +347,30 @@ class MedicalTypoDetectorFinal:
                     'position': {'start': m.position[0], 'end': m.position[1]},
                     'context': context,
                     'score': m.score
+                })
+                matched_spans.add((m.position[0], m.position[1]))
+
+            # 1.5) 候选扩展 + KenLM 精筛（补齐未被显式混淆对覆盖的词）
+            for token, start, end in self._tokenize_with_positions(text):
+                if (start, end) in matched_spans:
+                    continue
+                if len(token) < 2 or len(token) > 8:
+                    continue
+                if not self._is_chinese_token(token):
+                    continue
+
+                best_suggestion = self._select_best_expanded_candidate(text, token, start, end)
+                if not best_suggestion:
+                    continue
+
+                context = find_error_context(text, start, end)
+                errors.append({
+                    'error': token,
+                    'suggestion': best_suggestion,
+                    'type': 'typo',
+                    'position': {'start': start, 'end': end},
+                    'context': context,
+                    'score': None,
                 })
         
         # 2. 词序错误检测
@@ -272,12 +404,68 @@ class MedicalTypoDetectorFinal:
         return errors
 
 
+_DETECTOR_SINGLETON = None
+
+
+def _get_detector_singleton() -> MedicalTypoDetectorFinal:
+    global _DETECTOR_SINGLETON
+    if _DETECTOR_SINGLETON is not None:
+        return _DETECTOR_SINGLETON
+
+    detector = MedicalTypoDetectorFinal()
+    detector.load()
+    _DETECTOR_SINGLETON = detector
+    return _DETECTOR_SINGLETON
+
+
+def detect_grammer_errors(report_text: str, conclusion_text: str) -> List[Dict]:
+    """统一语法错误检测入口，供主流程直接调用。"""
+    detector = _get_detector_singleton()
+    results: List[Dict] = []
+
+    text_sources = [
+        ("ReportStr", report_text or ""),
+        ("ConclusionStr", conclusion_text or ""),
+    ]
+
+    for source_field, text in text_sources:
+        if not text.strip():
+            continue
+
+        for err in detector.detect(text):
+            results.append(
+                {
+                    "source_field": source_field,
+                    "error_phrase": err.get("error", ""),
+                    "sentence": err.get("context", ""),
+                    "error_category": err.get("type", ""),
+                    "suggestion": err.get("suggestion"),
+                }
+            )
+
+    dedup = []
+    seen = set()
+    for item in results:
+        key = (
+            item.get("source_field"),
+            item.get("error_phrase"),
+            item.get("sentence"),
+            item.get("error_category"),
+            item.get("suggestion"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(item)
+    return dedup
+
+
 def process_excel_file(
     detector: MedicalTypoDetectorFinal,
     input_path: str,
     output_path: str,
     text_columns: List[str] = ['描述', '结论'],
-    limit: int = None
+    limit: Optional[int] = None
 ) -> Dict:
     """处理Excel文件"""
     print(f"读取数据: {input_path}")

@@ -5,13 +5,17 @@ import numpy as np
 import re
 import time
 import sys
+import os
+import importlib.util
 from datetime import datetime
 import jieba  
 from Extract_Entities import text_extrac_process
 import warnings
 from typing import Optional, List, Dict
+from collections import defaultdict
 from pydantic import BaseModel, Field
 from pathlib import Path
+from jinja2 import Template
 
 # 新模块化结构
 from report_analyze import (
@@ -28,161 +32,22 @@ if _GRAMMER_ROOT.exists() and str(_GRAMMER_ROOT) not in sys.path:
     sys.path.insert(0, str(_GRAMMER_ROOT))
 
 try:
-    from train.phase3_build_engine_v2 import FastMedicalCorrectorV2
-    from inference.word_order_detector import WordOrderDetector
-    from train.phase2_mine_blacklist import contains_digit_or_english
+    _grammar_module_path = _GRAMMER_ROOT / "inference" / "detect_real_data_final.py"
+    _spec = importlib.util.spec_from_file_location("grammer_detect_real_data_final", _grammar_module_path)
+    if _spec is None or _spec.loader is None:
+        raise ImportError("failed to create module spec for grammar detector")
+    _grammar_module = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_grammar_module)
+    detect_grammer_errors = _grammar_module.detect_grammer_errors
 except Exception:
-    FastMedicalCorrectorV2 = None
-    WordOrderDetector = None
-    contains_digit_or_english = None
+    def detect_grammer_errors(report_text: str, conclusion_text: str) -> List[Dict]:
+        return []
 
 # 导入 miss_ignore_pattern 用于结论缺失检测过滤
 miss_ignore_pattern = SystemConfig.miss_ignore_pattern()
 
 warnings.filterwarnings("ignore")
 jieba.load_userdict("config/user_dic_expand.txt")
-
-GRAMMAR_SENTENCE_PATTERN = re.compile(r'[。！？；，、：:;,.!?\n\r]+')
-_grammar_detector_instance = None
-
-
-def _split_into_sentences(text: str) -> List[tuple]:
-    if not text or not isinstance(text, str):
-        return []
-
-    sentences = []
-    start = 0
-    for match in GRAMMAR_SENTENCE_PATTERN.finditer(text):
-        end = match.start()
-        if end > start:
-            sentence = text[start:end].strip()
-            if sentence:
-                sentences.append((sentence, start, end))
-        start = match.end()
-
-    if start < len(text):
-        sentence = text[start:].strip()
-        if sentence:
-            sentences.append((sentence, start, len(text)))
-
-    return sentences
-
-
-def _find_error_context(text: str, error_start: int, error_end: int) -> str:
-    for sentence, sent_start, sent_end in _split_into_sentences(text):
-        if sent_start <= error_start < sent_end or sent_start < error_end <= sent_end:
-            return sentence
-    return text[error_start:error_end]
-
-
-def _is_sufficient_word_order_context(context: str, error_word: str) -> bool:
-    if not context:
-        return False
-    normalized_context = re.sub(r'\s+', '', context)
-    normalized_error = re.sub(r'\s+', '', error_word)
-    if normalized_context == normalized_error:
-        return False
-    if len(normalized_context) <= len(normalized_error) + 1:
-        return False
-    return True
-
-
-def _get_grammar_detector():
-    global _grammar_detector_instance
-    if _grammar_detector_instance is not None:
-        return _grammar_detector_instance
-
-    if FastMedicalCorrectorV2 is None or WordOrderDetector is None or contains_digit_or_english is None:
-        _grammar_detector_instance = False
-        return _grammar_detector_instance
-
-    try:
-        corrector = FastMedicalCorrectorV2()
-        engine_path = _GRAMMER_ROOT / "models" / "ac_automaton_v2.pkl"
-        if engine_path.exists():
-            corrector.load(str(engine_path))
-        else:
-            corrector.load_blacklists(
-                str(_GRAMMER_ROOT / "models" / "medical_confusion.txt"),
-                str(_GRAMMER_ROOT / "models" / "high_risk_general.txt"),
-            )
-            corrector.save(str(engine_path))
-
-        word_order_path = _GRAMMER_ROOT / "models" / "word_order_templates.json"
-        word_order_detector = WordOrderDetector(str(word_order_path)) if word_order_path.exists() else None
-
-        _grammar_detector_instance = {
-            "corrector": corrector,
-            "word_order_detector": word_order_detector,
-        }
-    except Exception:
-        _grammar_detector_instance = False
-
-    return _grammar_detector_instance
-
-
-def detect_grammer_errors(report_text: str, conclusion_text: str) -> List[Dict]:
-    detector = _get_grammar_detector()
-    if not detector:
-        return []
-
-    results = []
-    text_sources = [
-        ("ReportStr", report_text or ""),
-        ("ConclusionStr", conclusion_text or ""),
-    ]
-
-    for source_field, text in text_sources:
-        if not text.strip():
-            continue
-
-        # 1) typo / general_high_risk
-        for match in detector["corrector"].scan(text):
-            if contains_digit_or_english(match.error):
-                continue
-            if match.suggestion and contains_digit_or_english(match.suggestion):
-                continue
-
-            context = _find_error_context(text, match.position[0], match.position[1])
-            results.append({
-                "source_field": source_field,
-                "error_phrase": match.error,
-                "sentence": context,
-                "error_category": match.error_type,
-                "suggestion": match.suggestion,
-            })
-
-        # 2) word_order
-        word_order_detector = detector.get("word_order_detector")
-        if word_order_detector:
-            for e in word_order_detector.detect(text):
-                context = _find_error_context(text, e['position'][0], e['position'][1])
-                if not _is_sufficient_word_order_context(context, e['error']):
-                    continue
-                results.append({
-                    "source_field": source_field,
-                    "error_phrase": e['error'],
-                    "sentence": context,
-                    "error_category": "word_order",
-                    "suggestion": e.get('suggestion'),
-                })
-
-    # 去重
-    dedup = []
-    seen = set()
-    for item in results:
-        key = (
-            item.get("source_field"),
-            item.get("error_phrase"),
-            item.get("sentence"),
-            item.get("error_category"),
-            item.get("suggestion"),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        dedup.append(item)
-    return dedup
 
 class Report(BaseModel):
     """报告医生的数据结构.<br>
@@ -958,196 +823,489 @@ def CheckRADS(StudyPartStr:str,ConclusionStr:str,modality:str):
             return "缺少PI-RADS分类"
     return ""
 
-def Report_Quality(ReportTxt: Report, debug=False):
-    """对初诊医生的报告进行质控，返回阳性率、报告错误等信息."""
-    import time
-    timers = {}
-    total_start = time.time()
-    
-    # === Stage 1: 实体抽取 ===
-    t0 = time.time()
-    studypart_analyze = text_extrac_process(
-        report_text=ReportTxt.StudyPart, version="标题", modality=ReportTxt.modality) if ReportTxt.StudyPart else []
-    Conclusion_analyze = text_extrac_process(report_text=ReportTxt.ConclusionStr, version="报告", 
-                                             modality=ReportTxt.modality, add_info=studypart_analyze) if ReportTxt.ConclusionStr else []
-    ReportStr_analyze = text_extrac_process(report_text=ReportTxt.ReportStr, version="报告", 
-                                            modality=ReportTxt.modality, add_info=studypart_analyze) if ReportTxt.ReportStr else []
-    ReportTxt.applyTable=ReportTxt.applyTable.replace("  ", "\n")
-    apply_analyze=text_extrac_process(report_text=ReportTxt.applyTable, version="报告", 
-                                      modality=ReportTxt.modality, add_info=studypart_analyze) if ReportTxt.applyTable else []
-    timers['实体抽取'] = time.time() - t0
-    
-    # 为所有实体添加 ignore 字段
-    t0 = time.time()
-    Conclusion_analyze = add_ignore_field(Conclusion_analyze)
-    ReportStr_analyze = add_ignore_field(ReportStr_analyze)
-    timers['字段处理'] = time.time() - t0
-    
-    missing = []
-    inverse = []
-    special_missing = []
-    sex_error = []
-    conclusion_missing = []
-    orient_error = []
-    contradiction = []
-    none_standard_term = []
-    apply_orient=''
-    RADS=""
-    grammer_error = []
 
-    # 检查漏写部位
-    t0 = time.time()
-    if studypart_analyze and re.search(ignore_part,ReportTxt.StudyPart) is None:
-        missing,inverse = part_missing(
-            studypart_analyze, ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
-    timers['部位缺失检查'] = time.time() - t0
+def _generate_html_preview(result: dict, report_txt, processing_time: float = None, llm_validated: bool = False) -> str:
+    """
+    生成 HTML 预览文件
     
-    # 检查漏写特殊检查
-    t0 = time.time()
-    special_missing = check_special_missing(
-        ReportTxt.StudyPart, ReportTxt.ReportStr+ReportTxt.ConclusionStr,
-        ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
-    timers['特殊检查'] = time.time() - t0
-
-    # 检查描述与结论相符
-    t0 = time.time()
-    conclusion_perf = {}
-    if "骨龄" not in ReportTxt.StudyPart:
-        conclusion_missing, orient_error, conclusion_perf = check_report_conclusion(
-                                            Conclusion_analyze, ReportStr_analyze, ReportTxt.modality)
-    timers['描述结论检查'] = time.time() - t0
+    Args:
+        result: 质控结果字典
+        report_txt: Report 对象
+        processing_time: 处理耗时
+        llm_validated: 是否经过 LLM 验证
     
-    # 提取描述结论检查内部详细性能统计
-    if conclusion_perf:
-        timers['Rerank调用'] = conclusion_perf.get('rerank_time', 0)
-        timers['Rerank次数'] = conclusion_perf.get('rerank_calls', 0)
-        timers['语义相似度计算'] = conclusion_perf.get('semantic_sim_time', 0)
-        timers['语义计算次数'] = conclusion_perf.get('semantic_sim_calls', 0)
-        
-        # 内部详细步骤
-        detailed = conclusion_perf.get('detailed', {})
-        for name, t in detailed.items():
-            timers[f'[结论检查]{name}'] = t
+    Returns:
+        str: HTML 文件路径
+    """
+    from jinja2 import Template
+    from datetime import datetime
+    import html as html_module
+    import re
     
-    # 检查矛盾
-    t0 = time.time()
-    contradiction = check_contradiction(ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
-    timers['矛盾检查'] = time.time() - t0
+    # 读取模板
+    template_path = Path(__file__).parent / "templates" / "report_preview.html"
+    if not template_path.exists():
+        # 如果模板不存在，使用内置模板
+        template_str = _get_default_template()
+    else:
+        template_str = template_path.read_text(encoding='utf-8')
     
-    # 检查性别错误（先做规则检查，然后一起LLM验证）
-    all_analyze = ReportStr_analyze + Conclusion_analyze
-    sex_error_str = CheckSex(all_analyze, ReportTxt.Sex)
-    sex_error = [sex_error_str] if sex_error_str else []
+    template = Template(template_str)
     
-    # === Stage 2-4: 统一批量LLM验证 ===
-    t0 = time.time()
-    llm_validation_triggered = False
-    if conclusion_missing or orient_error or contradiction or sex_error:
-        llm_validation_triggered = True
-        conclusion_missing, orient_error, contradiction, sex_error = batch_validate_with_llm(
-            conclusion_missing,
-            orient_error,
-            contradiction,
-            sex_error,
-            ReportTxt.Sex,
-            ReportTxt.ReportStr,
-            ReportTxt.ConclusionStr
-        )
-    timers['LLM验证'] = time.time() - t0
-    
-    # 将 sex_error 列表转回字符串格式（保持原有输出格式）
-    sex_error = sex_error[0] if sex_error else ""
-
-    # 判断测量单位错误
-    measure_unit_error = CheckMeasure(ReportTxt.ReportStr+"\n"+ReportTxt.ConclusionStr)
-
-    #判断术语不规范
-    global MR_non_standard, defult_non_standard,CT_non_standard
-    term_list = []
-    if len(ReportStr_analyze) > 0:
-        term_list.extend([a['original_short_sentence'] for a in ReportStr_analyze])
-    if len(Conclusion_analyze) > 0:
-        term_list.extend([a['original_short_sentence'] for a in Conclusion_analyze])
-    term_list = set(term_list)
-    for term in term_list:
-        if ReportTxt.modality == "MR":
-            mat = re.findall(f"{MR_non_standard}|{defult_non_standard}", term,re.I)
-        else:
-            mat = re.findall(CT_non_standard +"|"+defult_non_standard, term,re.I)
-        mat.extend(detect_abnormal_medical_terms(term))
-        if mat != []:
-            none_standard_term.append(
-                term.replace("\n","") + " 中术语“" + ",".join(mat) + "”不标准")
-    
-   
-    #判断申请单方位错误
-    apply_orient=applytable_error(apply_analyze,studypart_analyze,ReportStr_analyze,Conclusion_analyze,ReportTxt.modality)
-    
-    # 判断危急值
-    Critical_value = CheckCritical(
-        Conclusion_analyze, ReportStr_analyze, ReportTxt.modality)
-
-    # 语法错误（grammer 子系统）
-    t0 = time.time()
-    grammer_error = detect_grammer_errors(ReportTxt.ReportStr, ReportTxt.ConclusionStr)
-    timers['语法错误检查'] = time.time() - t0
-
-    #检查RADS分类
-    t0 = time.time()
-    RADS=CheckRADS(ReportTxt.StudyPart, ReportTxt.ConclusionStr,ReportTxt.modality)
-    timers['RADS检查'] = time.time() - t0
-    
-    total_time = time.time() - total_start
-    timers['总计'] = total_time
-    
-    if debug:
-        print("\n" + "="*60)
-        print("详细耗时统计")
-        print("="*60)
-        
-        # 提取整数计数项（不是时间）
-        rerank_calls = timers.pop('Rerank次数', 0)
-        semantic_calls = timers.pop('语义计算次数', 0)
-        
-        # 过滤掉值为0的计时器
-        filtered_timers = {k: v for k, v in timers.items() if v > 0.001}
-        
-        # 按耗时排序
-        sorted_timers = sorted(filtered_timers.items(), key=lambda x: x[1], reverse=True)
-        for name, t in sorted_timers:
-            pct = (t / total_time * 100) if total_time > 0 else 0
-            bar = "█" * int(pct / 2)
-            print(f"{name:20s}: {t:6.3f}s ({pct:5.1f}%) {bar}")
-        
-        # 显示调用次数
-        print()
-        print("调用次数统计:")
-        if rerank_calls:
-            print(f"  Rerank调用: {int(rerank_calls)}次")
-        if semantic_calls:
-            print(f"  语义相似度计算: {int(semantic_calls)}次")
-        
-        print("="*60)
-
-    return {
-        "partmissing": missing,#报告部位缺失
-        "partinverse":inverse, #检查项目方位错误 
-        "special_missing": special_missing,#检查方法错误或缺失
-        "conclusion_missing": conclusion_missing,#结论与描述不对应
-        "orient_error": orient_error,#结论与描述方位（左右）不符合
-        "contradiction": contradiction,#语言矛盾
-        "sex_error": sex_error,#性别错误
-        "measure_unit_error": measure_unit_error,#测量单位错误
-        "none_standard_term":none_standard_term,#术语不规范
-        'RADS':RADS,#分类
-        "Critical_value": Critical_value,#危急值
-        "apply_orient":apply_orient,
-        "grammer_error": grammer_error, # 语法错误（错误短语/短句/类别）
-        "_timers": timers,  # 内部性能统计
+    # 准备错误数据
+    errors = {
+        'partmissing': result.get('partmissing', []),
+        'partinverse': result.get('partinverse', []),
+        'special_missing': result.get('special_missing', []),
+        'conclusion_missing': result.get('conclusion_missing', []),
+        'orient_error': result.get('orient_error', []),
+        'contradiction': result.get('contradiction', []),
+        'sex_error': result.get('sex_error', ''),
+        'measure_unit_error': result.get('measure_unit_error', ''),
+        'none_standard_term': result.get('none_standard_term', []),
+        'rads': result.get('RADS', ''),
+        'critical_value': result.get('Critical_value', []),
+        'apply_orient': result.get('apply_orient', ''),
+        'grammer_error': result.get('grammer_error', []),
     }
+    
+    # 检查哪些错误类型存在
+    has_errors = {
+        'partmissing': bool(errors['partmissing']),
+        'partinverse': bool(errors['partinverse']),
+        'special_missing': bool(errors['special_missing']),
+        'conclusion_missing': bool(errors['conclusion_missing']),
+        'orient_error': bool(errors['orient_error']),
+        'contradiction': bool(errors['contradiction']),
+        'sex_error': bool(errors['sex_error']),
+        'measure_unit_error': bool(errors['measure_unit_error']),
+        'none_standard_term': bool(errors['none_standard_term']),
+        'rads': bool(errors['rads']),
+        'critical_value': bool(errors['critical_value']),
+        'apply_orient': bool(errors['apply_orient']),
+        'grammer_error': bool(errors['grammer_error']),
+    }
+    
+    # 统计错误数量
+    error_count = sum([
+        len(v) if isinstance(v, list) else (1 if v else 0)
+        for v in errors.values()
+    ])
+    
+    # 高亮文本
+    highlighted_report = _highlight_text(
+        html_module.escape(report_txt.ReportStr or ''), 
+        errors, 
+        'ReportStr'
+    )
+    highlighted_conclusion = _highlight_text(
+        html_module.escape(report_txt.ConclusionStr or ''), 
+        errors, 
+        'ConclusionStr'
+    )
+    
+    # 渲染模板
+    html_content = template.render(
+        report_id=datetime.now().strftime('%Y%m%d_%H%M%S'),
+        timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        modality=report_txt.modality,
+        sex=report_txt.Sex,
+        study_part=report_txt.StudyPart,
+        processing_time=processing_time,
+        llm_validated=llm_validated,
+        errors=errors,
+        has_errors=has_errors,
+        has_any_error=error_count > 0,
+        error_count=error_count,
+        highlighted_report=highlighted_report,
+        highlighted_conclusion=highlighted_conclusion,
+    )
+    
+    # 保存文件
+    output_dir = Path('output')
+    output_dir.mkdir(exist_ok=True)
+    html_path = output_dir / f"report_preview_{int(time.time())}.html"
+    html_path.write_text(html_content, encoding='utf-8')
+    
+    return str(html_path)
 
 
+def _highlight_text(text: str, errors: dict, source_field: str, html_module=None) -> str:
+    """
+    对文本进行高亮处理
+    
+    Args:
+        text: 原始文本（已转义）
+        errors: 错误字典
+        source_field: 'ReportStr' 或 'ConclusionStr'
+        html_module: html 模块，用于转义错误文本
+    
+    Returns:
+        str: 高亮后的 HTML
+    """
+    import html as html_mod
+    
+    if not text:
+        return text
+    
+    # 收集高亮区间
+    highlights = []
+    
+    # 1. 处理 grammer_error
+    for ge in errors.get('grammer_error', []):
+        if ge.get('source_field') == source_field:
+            error_phrase = html_mod.escape(ge.get('error_phrase', ''))
+            if error_phrase and error_phrase in text:
+                # 找到所有出现位置
+                start = 0
+                while True:
+                    idx = text.find(error_phrase, start)
+                    if idx == -1:
+                        break
+                    highlights.append({
+                        'start': idx,
+                        'end': idx + len(error_phrase),
+                        'class': 'highlight-grammer',
+                        'priority': 1
+                    })
+                    start = idx + 1
+    
+    # 2. 处理 conclusion_missing（只在结论中标记）
+    if source_field == 'ConclusionStr':
+        for missing in errors.get('conclusion_missing', []):
+            missing_escaped = html_mod.escape(missing)
+            if missing_escaped in text:
+                start = text.find(missing_escaped)
+                highlights.append({
+                    'start': start,
+                    'end': start + len(missing_escaped),
+                    'class': 'highlight-conclusion-missing',
+                    'priority': 2
+                })
+    
+    # 3. 处理 orient_error
+    for orient_err in errors.get('orient_error', []):
+        # 解析格式: "[描述]句子A；[结论]句子B"
+        match = re.search(r'\[描述\](.+?)；\[结论\](.+)', orient_err)
+        if match:
+            desc_part = html_mod.escape(match.group(1))
+            concl_part = html_mod.escape(match.group(2))
+            
+            if source_field == 'ReportStr' and desc_part in text:
+                start = text.find(desc_part)
+                highlights.append({
+                    'start': start,
+                    'end': start + len(desc_part),
+                    'class': 'highlight-orient-desc',
+                    'priority': 3
+                })
+            elif source_field == 'ConclusionStr' and concl_part in text:
+                start = text.find(concl_part)
+                highlights.append({
+                    'start': start,
+                    'end': start + len(concl_part),
+                    'class': 'highlight-orient-concl',
+                    'priority': 3
+                })
+    
+    # 4. 处理 contradiction
+    for i, contra in enumerate(errors.get('contradiction', [])):
+        contra_escaped = html_mod.escape(contra)
+        if contra_escaped in text:
+            start = text.find(contra_escaped)
+            highlights.append({
+                'start': start,
+                'end': start + len(contra_escaped),
+                'class': 'highlight-contradiction',
+                'priority': 4
+            })
+    
+    # 5. 处理 Critical_value
+    for cv in errors.get('critical_value', []):
+        desc = html_mod.escape(cv.get('description', ''))
+        if desc and desc in text:
+            start = text.find(desc)
+            highlights.append({
+                'start': start,
+                'end': start + len(desc),
+                'class': 'highlight-critical',
+                'priority': 0  # 最高优先级
+            })
+    
+    # 按优先级和位置排序
+    highlights.sort(key=lambda x: (x['start'], x['priority']))
+    
+    # 合并重叠区间（优先级高的保留）
+    merged = []
+    for h in highlights:
+        if not merged:
+            merged.append(h)
+        else:
+            last = merged[-1]
+            if h['start'] < last['end']:
+                # 有重叠，保留优先级高的
+                if h['priority'] < last['priority']:
+                    merged[-1] = h
+            else:
+                merged.append(h)
+    
+    # 应用高亮
+    result = []
+    last_end = 0
+    for h in merged:
+        result.append(text[last_end:h['start']])
+        result.append(f'<span class="{h["class"]}">')
+        result.append(text[h['start']:h['end']])
+        result.append('</span>')
+        last_end = h['end']
+    result.append(text[last_end:])
+    
+    return ''.join(result)
 
+
+def _get_default_template() -> str:
+    """获取默认模板（当模板文件不存在时使用）"""
+    return '''<!DOCTYPE html>
+<html>
+<head><title>Report Preview</title></head>
+<body><h1>Template not found</h1></body>
+</html>'''
+
+def Report_Quality(ReportTxt: Report, debug=False, llm: Optional[bool] = None, html: bool = False):
+    """
+    对初诊医生的报告进行质控，返回阳性率、报告错误等信息.
+    
+    Args:
+        ReportTxt: 报告数据模型
+        debug: 是否打印调试信息
+        llm: LLM验证开关，None=使用环境变量，True=强制开启，False=强制关闭
+        html: 是否生成HTML预览文件
+    
+    Returns:
+        dict: 包含各项质控结果的字典，如果 html=True 则额外包含 '_html_path' 字段
+    """
+    import time
+    
+    # 保存原始 LLM 设置
+    original_llm_setting = os.getenv('USE_LLM_VALIDATION')
+    
+    # 根据 llm 参数设置环境变量
+    if llm is not None:
+        os.environ['USE_LLM_VALIDATION'] = 'true' if llm else 'false'
+    
+    try:
+        timers = {}
+        total_start = time.time()
+        
+        # === Stage 1: 实体抽取 ===
+        t0 = time.time()
+        studypart_analyze = text_extrac_process(
+            report_text=ReportTxt.StudyPart, version="标题", modality=ReportTxt.modality) if ReportTxt.StudyPart else []
+        Conclusion_analyze = text_extrac_process(report_text=ReportTxt.ConclusionStr, version="报告", 
+                                                 modality=ReportTxt.modality, add_info=studypart_analyze) if ReportTxt.ConclusionStr else []
+        ReportStr_analyze = text_extrac_process(report_text=ReportTxt.ReportStr, version="报告", 
+                                                modality=ReportTxt.modality, add_info=studypart_analyze) if ReportTxt.ReportStr else []
+        ReportTxt.applyTable=ReportTxt.applyTable.replace("  ", "\n")
+        apply_analyze=text_extrac_process(report_text=ReportTxt.applyTable, version="报告", 
+                                          modality=ReportTxt.modality, add_info=studypart_analyze) if ReportTxt.applyTable else []
+        timers['实体抽取'] = time.time() - t0
+        
+        # 为所有实体添加 ignore 字段
+        t0 = time.time()
+        Conclusion_analyze = add_ignore_field(Conclusion_analyze)
+        ReportStr_analyze = add_ignore_field(ReportStr_analyze)
+        timers['字段处理'] = time.time() - t0
+        
+        missing = []
+        inverse = []
+        special_missing = []
+        sex_error = []
+        conclusion_missing = []
+        orient_error = []
+        contradiction = []
+        none_standard_term = []
+        apply_orient=''
+        RADS=""
+        grammer_error = []
+
+        # 检查漏写部位
+        t0 = time.time()
+        if studypart_analyze and re.search(ignore_part,ReportTxt.StudyPart) is None:
+            missing,inverse = part_missing(
+                studypart_analyze, ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
+        timers['部位缺失检查'] = time.time() - t0
+        
+        # 检查漏写特殊检查
+        t0 = time.time()
+        special_missing = check_special_missing(
+            ReportTxt.StudyPart, ReportTxt.ReportStr+ReportTxt.ConclusionStr,
+            ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
+        timers['特殊检查'] = time.time() - t0
+
+        # 检查描述与结论相符
+        t0 = time.time()
+        conclusion_perf = {}
+        if "骨龄" not in ReportTxt.StudyPart:
+            conclusion_missing, orient_error, conclusion_perf = check_report_conclusion(
+                                                Conclusion_analyze, ReportStr_analyze, ReportTxt.modality)
+        timers['描述结论检查'] = time.time() - t0
+        
+        # 提取描述结论检查内部详细性能统计
+        if conclusion_perf:
+            timers['Rerank调用'] = conclusion_perf.get('rerank_time', 0)
+            timers['Rerank次数'] = conclusion_perf.get('rerank_calls', 0)
+            timers['语义相似度计算'] = conclusion_perf.get('semantic_sim_time', 0)
+            timers['语义计算次数'] = conclusion_perf.get('semantic_sim_calls', 0)
+            
+            # 内部详细步骤
+            detailed = conclusion_perf.get('detailed', {})
+            for name, t in detailed.items():
+                timers[f'[结论检查]{name}'] = t
+        
+        # 检查矛盾
+        t0 = time.time()
+        contradiction = check_contradiction(ReportStr_analyze, Conclusion_analyze, ReportTxt.modality)
+        timers['矛盾检查'] = time.time() - t0
+        
+        # 检查性别错误（先做规则检查，然后一起LLM验证）
+        all_analyze = ReportStr_analyze + Conclusion_analyze
+        sex_error_str = CheckSex(all_analyze, ReportTxt.Sex)
+        sex_error = [sex_error_str] if sex_error_str else []
+        
+        # === Stage 2-4: 统一批量LLM验证 ===
+        t0 = time.time()
+        llm_validation_triggered = False
+        llm_actually_validated = False
+        if conclusion_missing or orient_error or contradiction or sex_error:
+            llm_validation_triggered = True
+            # 检查是否真的会进行LLM验证
+            from report_analyze.config import LLMConfig
+            if LLMConfig.USE_LLM_VALIDATION():
+                llm_actually_validated = True
+            conclusion_missing, orient_error, contradiction, sex_error = batch_validate_with_llm(
+                conclusion_missing,
+                orient_error,
+                contradiction,
+                sex_error,
+                ReportTxt.Sex,
+                ReportTxt.ReportStr,
+                ReportTxt.ConclusionStr
+            )
+        timers['LLM验证'] = time.time() - t0
+        
+        # 将 sex_error 列表转回字符串格式（保持原有输出格式）
+        sex_error = sex_error[0] if sex_error else ""
+
+        # 判断测量单位错误
+        measure_unit_error = CheckMeasure(ReportTxt.ReportStr+"\n"+ReportTxt.ConclusionStr)
+
+        #判断术语不规范
+        global MR_non_standard, defult_non_standard,CT_non_standard
+        term_list = []
+        if len(ReportStr_analyze) > 0:
+            term_list.extend([a['original_short_sentence'] for a in ReportStr_analyze])
+        if len(Conclusion_analyze) > 0:
+            term_list.extend([a['original_short_sentence'] for a in Conclusion_analyze])
+        term_list = set(term_list)
+        for term in term_list:
+            if ReportTxt.modality == "MR":
+                mat = re.findall(f"{MR_non_standard}|{defult_non_standard}", term,re.I)
+            else:
+                mat = re.findall(CT_non_standard +"|"+defult_non_standard, term,re.I)
+            mat.extend(detect_abnormal_medical_terms(term))
+            if mat != []:
+                none_standard_term.append(
+                    term.replace("\n","") + " 中术语" + ",".join(mat) + "不标准")
+        
+       
+        #判断申请单方位错误
+        apply_orient=applytable_error(apply_analyze,studypart_analyze,ReportStr_analyze,Conclusion_analyze,ReportTxt.modality)
+        
+        # 判断危急值
+        Critical_value = CheckCritical(
+            Conclusion_analyze, ReportStr_analyze, ReportTxt.modality)
+
+        # 语法错误（grammer 子系统）
+        t0 = time.time()
+        grammer_error = detect_grammer_errors(ReportTxt.ReportStr, ReportTxt.ConclusionStr)
+        timers['语法错误检查'] = time.time() - t0
+
+        #检查RADS分类
+        t0 = time.time()
+        RADS=CheckRADS(ReportTxt.StudyPart, ReportTxt.ConclusionStr,ReportTxt.modality)
+        timers['RADS检查'] = time.time() - t0
+        
+        total_time = time.time() - total_start
+        timers['总计'] = total_time
+        
+        if debug:
+            print("\n" + "="*60)
+            print("详细耗时统计")
+            print("="*60)
+            
+            # 提取整数计数项（不是时间）
+            rerank_calls = timers.pop('Rerank次数', 0)
+            semantic_calls = timers.pop('语义计算次数', 0)
+            
+            # 过滤掉值为0的计时器
+            filtered_timers = {k: v for k, v in timers.items() if v > 0.001}
+            
+            # 按耗时排序
+            sorted_timers = sorted(filtered_timers.items(), key=lambda x: x[1], reverse=True)
+            for name, t in sorted_timers:
+                pct = (t / total_time * 100) if total_time > 0 else 0
+                bar = "█" * int(pct / 2)
+                print(f"{name:20s}: {t:6.3f}s ({pct:5.1f}%) {bar}")
+            
+            # 显示调用次数
+            print()
+            print("调用次数统计:")
+            if rerank_calls:
+                print(f"  Rerank调用: {int(rerank_calls)}次")
+            if semantic_calls:
+                print(f"  语义相似度计算: {int(semantic_calls)}次")
+            
+            print("="*60)
+
+        result = {
+            "partmissing": missing,#报告部位缺失
+            "partinverse":inverse, #检查项目方位错误 
+            "special_missing": special_missing,#检查方法错误或缺失
+            "conclusion_missing": conclusion_missing,#结论与描述不对应
+            "orient_error": orient_error,#结论与描述方位（左右）不符合
+            "contradiction": contradiction,#语言矛盾
+            "sex_error": sex_error,#性别错误
+            "measure_unit_error": measure_unit_error,#测量单位错误
+            "none_standard_term":none_standard_term,#术语不规范
+            'RADS':RADS,#分类
+            "Critical_value": Critical_value,#危急值
+            "apply_orient":apply_orient,
+            "grammer_error": grammer_error, # 语法错误（错误短语/短句/类别）
+            "_timers": timers,  # 内部性能统计
+        }
+        
+        # 生成 HTML 预览
+        if html:
+            html_path = _generate_html_preview(
+                result, ReportTxt, 
+                processing_time=total_time,
+                llm_validated=llm_actually_validated and (llm is not False)
+            )
+            result['_html_path'] = html_path
+        
+        # 如果 debug=False，移除性能统计字段（但保留 html 相关字段）
+        if not debug:
+            result = {k: v for k, v in result.items() if k != '_timers'}
+        
+        return result
+        
+    finally:
+        # 恢复原始 LLM 设置
+        if llm is not None:
+            if original_llm_setting is not None:
+                os.environ['USE_LLM_VALIDATION'] = original_llm_setting
+            else:
+                os.environ.pop('USE_LLM_VALIDATION', None)
 
 if __name__ == "__main__":
     # 报告医生数据结构
@@ -1156,7 +1314,7 @@ if __name__ == "__main__":
 鼻腔左侧钩突(位于中鼻甲前上方的骨性突起)形态异常其尖端部分可见一局限性软组织密度影，大小约1cmx0.8cm，边缘较清晰，与周围组织分界尚可，未见明显骨质破坏。
         """,
    ConclusionStr = """
-鼻腔右侧钩突肥大并伴有软组织肿块，考虑慢性炎症或肿瘤性病变可能性大建议进一步IRI检查及活检以明确诊断。
+鼻腔右侧钩突肥大并伴有软组织肿块，考虑慢性炎症或肿瘤性兵变可能性大，建议进步MRI检查及活检以明确诊断。
 
    """,
         StudyPart = '副鼻窦',
@@ -1165,6 +1323,6 @@ if __name__ == "__main__":
         applyTable=""
  
     )
-    print("Report_Quality=", Report_Quality(a, debug=False))
+    print("Report_Quality=", Report_Quality(a, debug=False, llm=None, html=True))
 
 

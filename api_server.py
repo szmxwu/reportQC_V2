@@ -119,6 +119,10 @@ class QualityCheckRequest(BaseModel):
         default=True,
         description="是否启用 LLM 后置精筛"
     )
+    generate_html: bool = Field(
+        default=False,
+        description="是否生成 HTML 预览文件"
+    )
 
 
 class QualityCheckResponse(BaseModel):
@@ -157,6 +161,10 @@ class QualityCheckResponse(BaseModel):
     llm_validated: bool = Field(
         default=False,
         description="是否经过 LLM 验证"
+    )
+    html_path: Optional[str] = Field(
+        default=None,
+        description="HTML 预览文件路径（如果 generate_html=True）"
     )
 
 
@@ -259,6 +267,7 @@ async def check_quality(request: QualityCheckRequest):
     
     - 使用规则引擎快速检测
     - 可选 LLM 后置精筛（降低假阳性）
+    - 可选生成 HTML 预览文件
     - 返回完整的质控结果
     """
     import time
@@ -276,7 +285,12 @@ async def check_quality(request: QualityCheckRequest):
         )
         
         # 执行质控（同步调用）
-        result = Report_Quality(report, debug=False)
+        result = Report_Quality(
+            report, 
+            debug=False, 
+            llm=request.use_llm,
+            html=request.generate_html
+        )
         
         # 计算处理时间
         processing_time = time.time() - start_time
@@ -288,10 +302,12 @@ async def check_quality(request: QualityCheckRequest):
         )
         
         # 构建响应
+        html_path = result.pop('_html_path', None) if request.generate_html else None
         return QualityCheckResponse(
             **result,
             processing_time=processing_time,
-            llm_validated=llm_validated
+            llm_validated=llm_validated,
+            html_path=html_path
         )
         
     except Exception as e:
@@ -314,10 +330,6 @@ async def check_quality_fast(request: QualityCheckRequest):
     start_time = time.time()
     
     try:
-        # 临时禁用 LLM
-        original_use_llm = os.getenv('USE_LLM_VALIDATION')
-        os.environ['USE_LLM_VALIDATION'] = 'false'
-        
         report = Report(
             ConclusionStr=request.ConclusionStr,
             ReportStr=request.ReportStr,
@@ -327,17 +339,22 @@ async def check_quality_fast(request: QualityCheckRequest):
             applyTable=request.applyTable
         )
         
-        result = Report_Quality(report, debug=False)
+        # 执行质控（禁用 LLM，可选生成 HTML）
+        result = Report_Quality(
+            report, 
+            debug=False, 
+            llm=False,
+            html=request.generate_html
+        )
         processing_time = time.time() - start_time
         
-        # 恢复 LLM 设置
-        if original_use_llm:
-            os.environ['USE_LLM_VALIDATION'] = original_use_llm
-        
+        # 构建响应
+        html_path = result.pop('_html_path', None) if request.generate_html else None
         return QualityCheckResponse(
             **result,
             processing_time=processing_time,
-            llm_validated=False
+            llm_validated=False,
+            html_path=html_path
         )
         
     except Exception as e:
@@ -363,11 +380,6 @@ async def check_quality_batch(request: BatchQualityCheckRequest):
     success_count = 0
     failed_count = 0
     
-    # 临时设置 LLM 开关
-    original_use_llm = os.getenv('USE_LLM_VALIDATION')
-    if not request.use_llm:
-        os.environ['USE_LLM_VALIDATION'] = 'false'
-    
     try:
         for idx, report_req in enumerate(request.reports):
             start_time = time.time()
@@ -386,10 +398,18 @@ async def check_quality_batch(request: BatchQualityCheckRequest):
                     applyTable=report_req.applyTable
                 )
                 
-                # 执行质控
-                result = Report_Quality(report, debug=False)
+                # 执行质控（使用新的 llm 参数）
+                result = Report_Quality(
+                    report, 
+                    debug=False, 
+                    llm=request.use_llm
+                )
                 processing_time = time.time() - start_time
                 total_time += processing_time
+                
+                # 移除内部字段
+                result.pop('_timers', None)
+                result.pop('_html_path', None)
                 
                 results.append(BatchQualityCheckResult(
                     id=report_id,
@@ -411,10 +431,6 @@ async def check_quality_batch(request: BatchQualityCheckRequest):
                 ))
                 failed_count += 1
         
-        # 恢复 LLM 设置
-        if original_use_llm:
-            os.environ['USE_LLM_VALIDATION'] = original_use_llm
-        
         # 计算统计信息
         avg_time = total_time / len(request.reports) if request.reports else 0
         
@@ -430,10 +446,6 @@ async def check_quality_batch(request: BatchQualityCheckRequest):
         )
         
     except Exception as e:
-        # 恢复 LLM 设置
-        if original_use_llm:
-            os.environ['USE_LLM_VALIDATION'] = original_use_llm
-        
         raise HTTPException(
             status_code=500,
             detail=f"批量质控处理失败: {str(e)}"

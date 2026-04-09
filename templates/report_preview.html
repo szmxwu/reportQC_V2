@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>报告质控预览 - {{ report_id }}</title>
+    <style>
+        /* ===== Bootstrap 核心样式内联 ===== */
+        *, *::before, *::after {
+            box-sizing: border-box;
+        }
+        
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            font-size: 1rem;
+            font-weight: 400;
+            line-height: 1.5;
+            color: #212529;
+            background-color: #f5f5f5;
+        }
+        
+        .container-fluid {
+            width: 100%;
+            padding-right: 15px;
+            padding-left: 15px;
+            margin-right: auto;
+            margin-left: auto;
+            max-width: 1200px;
+        }
+        
+        .row {
+            display: flex;
+            flex-wrap: wrap;
+            margin-right: -15px;
+            margin-left: -15px;
+        }
+        
+        .col-12 {
+            flex: 0 0 100%;
+            max-width: 100%;
+            padding-right: 15px;
+            padding-left: 15px;
+        }
+        
+        /* Card 样式 */
+        .card {
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            word-wrap: break-word;
+            background-color: #fff;
+            background-clip: border-box;
+            border: 1px solid rgba(0,0,0,.125);
+            border-radius: 0.5rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .card-header {
+            padding: 0.75rem 1.25rem;
+            margin-bottom: 0;
+            background-color: #f8f9fa;
+            border-bottom: 1px solid rgba(0,0,0,.125);
+            font-weight: 600;
+        }
+        
+        .card-header.bg-primary {
+            background-color: #007bff !important;
+            color: white;
+        }
+        
+        .card-header.bg-warning {
+            background-color: #ffc107 !important;
+        }
+        
+        .card-body {
+            flex: 1 1 auto;
+            padding: 1.25rem;
+        }
+        
+        /* 标题样式 */
+        h2 {
+            margin-top: 0;
+            margin-bottom: 1.5rem;
+            font-weight: 600;
+            line-height: 1.2;
+            color: #333;
+        }
+        
+        h4 {
+            margin-top: 0;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+            line-height: 1.2;
+        }
+        
+        /* Badge 样式 */
+        .badge {
+            display: inline-block;
+            padding: 0.35em 0.65em;
+            font-size: 0.75em;
+            font-weight: 700;
+            line-height: 1;
+            text-align: center;
+            white-space: nowrap;
+            vertical-align: baseline;
+            border-radius: 0.375rem;
+        }
+        
+        .badge.bg-primary {
+            background-color: #007bff;
+            color: white;
+        }
+        
+        .badge.bg-info {
+            background-color: #17a2b8;
+            color: white;
+        }
+        
+        .badge.bg-danger {
+            background-color: #dc3545;
+            color: white;
+        }
+        
+        /* 文字样式 */
+        .text-muted {
+            color: #6c757d !important;
+        }
+        
+        .fs-6 {
+            font-size: 0.875rem !important;
+        }
+        
+        .ms-2 {
+            margin-left: 0.5rem !important;
+        }
+        
+        .mt-4 {
+            margin-top: 1.5rem !important;
+        }
+        
+        .mb-3 {
+            margin-bottom: 1rem !important;
+        }
+        
+        .mb-4 {
+            margin-bottom: 1.5rem !important;
+        }
+        
+        .mt-3 {
+            margin-top: 1rem !important;
+        }
+        
+        /* 布局网格 */
+        .row {
+            display: flex;
+            flex-wrap: wrap;
+        }
+        
+        .col-md-3 {
+            flex: 0 0 25%;
+            max-width: 25%;
+            padding: 0 15px;
+        }
+        
+        .col-md-6 {
+            flex: 0 0 50%;
+            max-width: 50%;
+            padding: 0 15px;
+        }
+        
+        .col-12 {
+            flex: 0 0 100%;
+            max-width: 100%;
+            padding: 0 15px;
+        }
+        
+        @media (max-width: 768px) {
+            .col-md-3, .col-md-6 {
+                flex: 0 0 100%;
+                max-width: 100%;
+            }
+        }
+        
+        /* ===== 自定义高亮样式 ===== */
+        .highlight-missing { 
+            background-color: #fff3cd; 
+            padding: 2px 4px; 
+            border-radius: 3px; 
+            font-weight: 600;
+        }
+        
+        .highlight-inverse { 
+            background-color: #ffe5cc; 
+            padding: 2px 4px; 
+            border-radius: 3px; 
+            font-weight: 600;
+        }
+        
+        .highlight-conclusion-missing { 
+            background-color: #f8d7da; 
+            padding: 2px 4px; 
+            border-radius: 3px; 
+            font-weight: 600;
+        }
+        
+        .highlight-orient-desc { 
+            background-color: #e2d4f0; 
+            padding: 2px 4px; 
+            border-radius: 3px; 
+            font-weight: 600;
+        }
+        
+        .highlight-orient-concl { 
+            background-color: #ffd6e7; 
+            padding: 2px 4px; 
+            border-radius: 3px; 
+            font-weight: 600;
+        }
+        
+        .highlight-contradiction { 
+            background-color: #d1ecf1; 
+            padding: 2px 4px; 
+            border-radius: 3px; 
+            font-weight: 600;
+        }
+        
+        .highlight-sex { 
+            background-color: #ff69b4; 
+            color: white; 
+            padding: 2px 4px; 
+            border-radius: 3px; 
+            font-weight: 600;
+        }
+        
+        .highlight-measure { 
+            background-color: #d4a574; 
+            color: white; 
+            padding: 2px 4px; 
+            border-radius: 3px; 
+            font-weight: 600;
+        }
+        
+        .highlight-term { 
+            background-color: #d6d8db; 
+            padding: 2px 4px; 
+            border-radius: 3px; 
+            font-weight: 600;
+        }
+        
+        .highlight-critical { 
+            background-color: #721c24; 
+            color: white; 
+            padding: 2px 4px; 
+            border-radius: 3px; 
+            font-weight: 600;
+            animation: blink 1.5s infinite;
+        }
+        
+        .highlight-apply { 
+            background-color: #d4edda; 
+            padding: 2px 4px; 
+            border-radius: 3px; 
+            font-weight: 600;
+        }
+        
+        .highlight-grammer { 
+            background-color: #fff9c4; 
+            border-bottom: 2px wavy red; 
+            padding: 2px 4px;
+            font-weight: 600;
+        }
+        
+        @keyframes blink { 
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        
+        /* ===== 报告布局 ===== */
+        .report-section { 
+            margin: 20px 0; 
+            padding: 20px; 
+            border: 1px solid #dee2e6; 
+            border-radius: 8px;
+            background-color: #f8f9fa;
+        }
+        
+        .report-label { 
+            font-weight: bold; 
+            color: #495057; 
+            margin-bottom: 15px;
+            font-size: 1.1em;
+            border-bottom: 2px solid #dee2e6;
+            padding-bottom: 10px;
+        }
+        
+        .report-content { 
+            white-space: pre-wrap; 
+            line-height: 2;
+            font-size: 1.05em;
+            color: #212529;
+        }
+        
+        /* 图例样式 */
+        .legend-item {
+            display: inline-block;
+            margin: 5px 10px 5px 0;
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 0.9em;
+            font-weight: 500;
+        }
+        
+        /* 错误汇总列表 */
+        .error-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .error-item {
+            padding: 10px 15px;
+            margin: 5px 0;
+            border-radius: 4px;
+            border-left: 4px solid;
+            background-color: #f8f9fa;
+        }
+        
+        .error-item ul {
+            margin-top: 5px;
+            margin-bottom: 0;
+            padding-left: 20px;
+        }
+        
+        .error-item li {
+            margin: 3px 0;
+        }
+        
+        /* 警告框 */
+        .alert {
+            position: relative;
+            padding: 1rem 1.5rem;
+            margin-bottom: 1rem;
+            border: 1px solid transparent;
+            border-radius: 0.5rem;
+        }
+        
+        .alert-success {
+            color: #155724;
+            background-color: #d4edda;
+            border-color: #c3e6cb;
+        }
+        
+        .alert-heading {
+            color: inherit;
+            font-weight: 600;
+        }
+        
+        /* 打印优化 */
+        @media print {
+            body {
+                background-color: white;
+            }
+            .card {
+                break-inside: avoid;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid mt-4">
+        <div class="row">
+            <div class="col-12">
+                <h2 class="mb-4">
+                    <span class="badge bg-primary">报告质控预览</span>
+                    <small class="text-muted fs-6 ms-2">{{ timestamp }}</small>
+                </h2>
+                
+                <!-- 基本信息 -->
+                <div class="card mb-4">
+                    <div class="card-header bg-primary">
+                        <strong>基本信息</strong>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-3"><strong>设备:</strong> {{ modality }}</div>
+                            <div class="col-md-3"><strong>性别:</strong> {{ sex }}</div>
+                            <div class="col-md-6"><strong>检查部位:</strong> {{ study_part }}</div>
+                        </div>
+                        {% if processing_time %}
+                        <div class="row mt-3">
+                            <div class="col-12 text-muted">
+                                <small>处理耗时: {{ "%.3f"|format(processing_time) }} 秒</small>
+                                {% if llm_validated %}
+                                <span class="badge bg-info ms-2">LLM验证</span>
+                                {% endif %}
+                            </div>
+                        </div>
+                        {% endif %}
+                    </div>
+                </div>
+                
+                <!-- 图例 -->
+                <div class="card mb-4">
+                    <div class="card-header">颜色图例</div>
+                    <div class="card-body">
+                        {% if has_errors.partmissing %}<span class="legend-item highlight-missing">部位缺失</span>{% endif %}
+                        {% if has_errors.partinverse %}<span class="legend-item highlight-inverse">方位错误</span>{% endif %}
+                        {% if has_errors.conclusion_missing %}<span class="legend-item highlight-conclusion-missing">结论缺失</span>{% endif %}
+                        {% if has_errors.orient_error %}<span class="legend-item highlight-orient-desc">方位不符-描述</span>{% endif %}
+                        {% if has_errors.orient_error %}<span class="legend-item highlight-orient-concl">方位不符-结论</span>{% endif %}
+                        {% if has_errors.contradiction %}<span class="legend-item highlight-contradiction">矛盾</span>{% endif %}
+                        {% if has_errors.sex_error %}<span class="legend-item highlight-sex">性别错误</span>{% endif %}
+                        {% if has_errors.measure_unit_error %}<span class="legend-item highlight-measure">测量值错误</span>{% endif %}
+                        {% if has_errors.none_standard_term %}<span class="legend-item highlight-term">术语不规范</span>{% endif %}
+                        {% if has_errors.critical_value %}<span class="legend-item highlight-critical">危急值</span>{% endif %}
+                        {% if has_errors.apply_orient %}<span class="legend-item highlight-apply">申请单方位错误</span>{% endif %}
+                        {% if has_errors.grammer_error %}<span class="legend-item highlight-grammer">语法错误</span>{% endif %}
+                    </div>
+                </div>
+                
+                <!-- 报告描述 -->
+                <div class="report-section">
+                    <div class="report-label">报告描述</div>
+                    <div class="report-content">{{ highlighted_report|safe }}</div>
+                </div>
+                
+                <!-- 报告结论 -->
+                <div class="report-section">
+                    <div class="report-label">报告结论</div>
+                    <div class="report-content">{{ highlighted_conclusion|safe }}</div>
+                </div>
+                
+                <!-- 错误汇总 -->
+                {% if has_any_error %}
+                <div class="card mt-4">
+                    <div class="card-header bg-warning">
+                        <strong>质控结果汇总</strong>
+                        <span class="badge bg-danger ms-2">{{ error_count }} 项问题</span>
+                    </div>
+                    <div class="card-body error-list">
+                        {% if errors.partmissing %}
+                        <div class="error-item" style="border-left-color: #ffc107; background-color: #fff3cd;">
+                            <strong>部位缺失:</strong> {{ errors.partmissing|join('、') }}
+                        </div>
+                        {% endif %}
+                        
+                        {% if errors.partinverse %}
+                        <div class="error-item" style="border-left-color: #ff9800; background-color: #ffe5cc;">
+                            <strong>方位错误:</strong> {{ errors.partinverse|join('、') }}
+                        </div>
+                        {% endif %}
+                        
+                        {% if errors.special_missing %}
+                        <div class="error-item" style="border-left-color: #2196f3; background-color: #e3f2fd;">
+                            <strong>特殊检查缺失:</strong> {{ errors.special_missing|join('、') }}
+                        </div>
+                        {% endif %}
+                        
+                        {% if errors.conclusion_missing %}
+                        <div class="error-item" style="border-left-color: #f44336; background-color: #ffebee;">
+                            <strong>结论缺失:</strong> {{ errors.conclusion_missing|join('、') }}
+                        </div>
+                        {% endif %}
+                        
+                        {% if errors.orient_error %}
+                        <div class="error-item" style="border-left-color: #9c27b0; background-color: #f3e5f5;">
+                            <strong>方位不符:</strong>
+                            <ul class="mb-0 mt-2">
+                                {% for err in errors.orient_error %}
+                                <li>{{ err }}</li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
+                        
+                        {% if errors.contradiction %}
+                        <div class="error-item" style="border-left-color: #00bcd4; background-color: #e0f7fa;">
+                            <strong>语言矛盾:</strong>
+                            <ul class="mb-0 mt-2">
+                                {% for i in range(0, errors.contradiction|length, 2) %}
+                                <li>{{ errors.contradiction[i] }} vs {{ errors.contradiction[i+1] if i+1 < errors.contradiction|length else '' }}</li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
+                        
+                        {% if errors.sex_error %}
+                        <div class="error-item" style="border-left-color: #e91e63; background-color: #fce4ec;">
+                            <strong>性别错误:</strong> {{ errors.sex_error }}
+                        </div>
+                        {% endif %}
+                        
+                        {% if errors.measure_unit_error %}
+                        <div class="error-item" style="border-left-color: #795548; background-color: #efebe9;">
+                            <strong>测量值错误:</strong> {{ errors.measure_unit_error }}
+                        </div>
+                        {% endif %}
+                        
+                        {% if errors.none_standard_term %}
+                        <div class="error-item" style="border-left-color: #9e9e9e; background-color: #f5f5f5;">
+                            <strong>术语不规范:</strong>
+                            <ul class="mb-0 mt-2">
+                                {% for term in errors.none_standard_term %}
+                                <li>{{ term }}</li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
+                        
+                        {% if errors.rads %}
+                        <div class="error-item" style="border-left-color: #673ab7; background-color: #ede7f6;">
+                            <strong>RADS分类:</strong> {{ errors.rads }}
+                        </div>
+                        {% endif %}
+                        
+                        {% if errors.critical_value %}
+                        <div class="error-item" style="border-left-color: #b71c1c; background-color: #ffebee;">
+                            <strong>危急值:</strong>
+                            <ul class="mb-0 mt-2">
+                                {% for cv in errors.critical_value %}
+                                <li><strong>{{ cv.category }}</strong>: {{ cv.description }}</li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
+                        
+                        {% if errors.apply_orient %}
+                        <div class="error-item" style="border-left-color: #4caf50; background-color: #e8f5e9;">
+                            <strong>申请单方位错误:</strong> {{ errors.apply_orient }}
+                        </div>
+                        {% endif %}
+                        
+                        {% if errors.grammer_error %}
+                        <div class="error-item" style="border-left-color: #ffeb3b; background-color: #fffde7;">
+                            <strong>语法错误:</strong>
+                            <ul class="mb-0 mt-2">
+                                {% for ge in errors.grammer_error %}
+                                <li>
+                                    <strong>{{ ge.error_phrase }}</strong> → {{ ge.suggestion or '建议修改' }}
+                                    <small class="text-muted">({{ ge.error_category }})</small>
+                                    <br><small class="text-muted">所在句: {{ ge.sentence }}</small>
+                                </li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
+                    </div>
+                </div>
+                {% else %}
+                <div class="alert alert-success mt-4" role="alert">
+                    <h4 class="alert-heading">🎉 恭喜！</h4>
+                    <p>未检测到明显质量问题。</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,6 +1,7 @@
 """
 配置管理模块
 """
+import configparser
 import os
 from pathlib import Path
 
@@ -37,8 +38,43 @@ RADIOLOGY_NGRAM = OUTPUT_DIR / "radiology_ngram.klm"
 RADIOLOGY_VOCAB = OUTPUT_DIR / "radiology_vocab.json"
 MEDICAL_CONFUSION = OUTPUT_DIR / "medical_confusion.txt"
 HIGH_RISK_GENERAL = OUTPUT_DIR / "high_risk_general.txt"
+EXPANDED_CANDIDATES = OUTPUT_DIR / "expanded_candidates.json"
 AC_AUTOMATON = OUTPUT_DIR / "ac_automaton.pkl"
 WORD_ORDER_TEMPLATES = OUTPUT_DIR / "word_order_templates.json"
+
+
+def _load_grammar_candidate_thresholds():
+    """从 user_config.ini 读取离线候选阈值，缺失时使用默认值。"""
+    defaults = {
+        "min_radio_freq": 100,
+        "two_char_threshold": 1000,
+        "max_variant_freq": 50,
+        "max_candidates_per_wrong": 8,
+    }
+
+    cfg = configparser.ConfigParser()
+    user_cfg_path = CONFIG_ROOT / "user_config.ini"
+    if not user_cfg_path.exists():
+        return defaults
+
+    cfg.read(user_cfg_path, encoding="utf-8")
+    section = "grammar_expanded_candidates"
+    if not cfg.has_section(section):
+        return defaults
+
+    for key, default_value in defaults.items():
+        try:
+            defaults[key] = cfg.getint(section, key, fallback=default_value)
+        except (ValueError, TypeError):
+            defaults[key] = default_value
+    return defaults
+
+
+_GRAMMAR_CANDIDATE_THRESHOLDS = _load_grammar_candidate_thresholds()
+EXPAND_MIN_RADIO_FREQ = _GRAMMAR_CANDIDATE_THRESHOLDS["min_radio_freq"]
+EXPAND_TWO_CHAR_THRESHOLD = _GRAMMAR_CANDIDATE_THRESHOLDS["two_char_threshold"]
+EXPAND_MAX_VARIANT_FREQ = _GRAMMAR_CANDIDATE_THRESHOLDS["max_variant_freq"]
+EXPAND_MAX_CANDIDATES_PER_WRONG = _GRAMMAR_CANDIDATE_THRESHOLDS["max_candidates_per_wrong"]
 
 # ==================== SSD 流式处理配置 ====================
 CHUNK_SIZE = 10000  # 每块处理 10000 条报告
@@ -116,4 +152,8 @@ def get_config():
         'pos_weight': POS_WEIGHT,
         'med_protect_weight': MED_PROTECT_WEIGHT,
         'ngram_order': NGRAM_ORDER,
+        'expand_min_radio_freq': EXPAND_MIN_RADIO_FREQ,
+        'expand_two_char_threshold': EXPAND_TWO_CHAR_THRESHOLD,
+        'expand_max_variant_freq': EXPAND_MAX_VARIANT_FREQ,
+        'expand_max_candidates_per_wrong': EXPAND_MAX_CANDIDATES_PER_WRONG,
     }

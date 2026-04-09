@@ -16,7 +16,7 @@
 pip install -r requirements.txt
 
 # 方式2：手动安装
-pip install fastapi uvicorn pandas numpy jieba gensim scipy pydantic python-dotenv httpx
+pip install fastapi uvicorn pandas numpy jieba gensim scipy pydantic python-dotenv httpx jinja2
 ```
 
 ### 2. 解压模型文件
@@ -70,9 +70,23 @@ curl -X POST "http://localhost:8000/api/v1/quality/check" \
     "StudyPart": "胸部/肺平扫,CT上腹部平扫",
     "Sex": "女",
     "applyTable": "",
-    "use_llm": true
+    "use_llm": true,
+    "generate_html": false
   }'
 ```
+
+**请求字段说明：**
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| ConclusionStr | string | 是 | 报告结论 |
+| ReportStr | string | 是 | 报告描述 |
+| modality | string | 是 | 设备类型 (CT/MR/DR/DX/MG) |
+| StudyPart | string | 是 | 检查条目名称 |
+| Sex | string | 是 | 患者性别 (男/女) |
+| applyTable | string | 否 | 申请单信息 |
+| use_llm | boolean | 否 | 是否启用 LLM，默认 `true` |
+| generate_html | boolean | 否 | 是否生成 HTML 预览，默认 `false` |
 
 **响应示例：**
 
@@ -92,11 +106,55 @@ curl -X POST "http://localhost:8000/api/v1/quality/check" \
   "apply_orient": "",
   "grammer_error": [],
   "processing_time": 0.85,
-  "llm_validated": true
+  "llm_validated": true,
+  "html_path": null
 }
 ```
 
-### 2. 批量质控检查
+**生成 HTML 预览示例：**
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/quality/check" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "ConclusionStr": "右肺上叶占位。",
+    "ReportStr": "左肺上叶可见占位。",
+    "modality": "CT",
+    "StudyPart": "胸部/肺平扫",
+    "Sex": "男",
+    "generate_html": true
+  }'
+```
+
+响应中会包含 `html_path` 字段，指向生成的 HTML 文件路径。
+
+### 2. HTML 预览功能
+
+当 `generate_html=true` 时，系统会生成一个独立的 HTML 预览文件：
+
+- **独立文件**：所有 CSS 样式内联，无需外部依赖，可离线打开
+- **颜色标注**：13 种错误类型用不同颜色高亮显示
+- **错误汇总**：底部显示所有检测到的质量问题
+- **文件位置**：`output/report_preview_{timestamp}.html`
+
+**高亮颜色对照：**
+
+| 颜色 | 错误类型 |
+|------|----------|
+| 🟡 黄色 | 部位缺失 |
+| 🟠 橙色 | 方位错误 |
+| 🔴 红色 | 结论缺失 |
+| 🟣 紫色 | 方位不符-描述 |
+| 🩷 粉色 | 方位不符-结论 |
+| 🔵 青色 | 语言矛盾 |
+| 💗 深粉 | 性别错误 |
+| 🟤 棕色 | 测量值错误 |
+| ⚪ 灰色 | 术语不规范 |
+| ⚫ 深红+闪烁 | 危急值 |
+| 🟢 绿色 | 申请单方位错误 |
+| 💛 淡黄+波浪线 | 语法错误 |
+
+### 3. 批量质控检查
 
 **请求示例：**
 
@@ -119,29 +177,7 @@ curl -X POST "http://localhost:8000/api/v1/quality/check/batch" \
   }'
 ```
 
-**响应示例：**
-
-```json
-{
-  "results": [
-    {
-      "id": "report_001",
-      "status": "success",
-      "partmissing": "可能漏写部位: 胆囊",
-      "conclusion_missing": "",
-      ...
-    }
-  ],
-  "summary": {
-    "total": 1,
-    "success": 1,
-    "failed": 0,
-    "avg_processing_time": 0.85
-  }
-}
-```
-
-### 3. 快速质控检查（无 LLM）
+### 4. 快速质控检查（无 LLM）
 
 适合大批量快速筛查，响应更快（约 200-500ms），但假阳性率较高。
 
@@ -153,69 +189,83 @@ curl -X POST "http://localhost:8000/api/v1/quality/check/fast" \
     "ReportStr": "双肺纹理增多、紊乱。",
     "modality": "DR",
     "StudyPart": "胸部正侧位",
-    "Sex": "男"
+    "Sex": "男",
+    "generate_html": false
   }'
 ```
 
-### 前端对接示例
-
-#### JavaScript/TypeScript
-
-```typescript
-// 单条检查
-async function checkReport(reportData: ReportData) {
-  const response = await fetch('http://localhost:8000/api/v1/quality/check', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(reportData)
-  });
-  
-  if (!response.ok) {
-    throw new Error(`HTTP error! status: ${response.status}`);
-  }
-  
-  const result = await response.json();
-  return result;
-}
-
-// 批量检查
-async function batchCheckReports(reports: ReportData[]) {
-  const response = await fetch('http://localhost:8000/api/v1/quality/check/batch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ reports, use_llm: true })
-  });
-  
-  return await response.json();
-}
-```
-
-#### Python
+## 🐍 Python API 直接使用
 
 ```python
-import requests
+from NLP_analyze import Report, Report_Quality
 
-def check_report(report_data):
-    """单条报告质控检查"""
-    response = requests.post(
-        'http://localhost:8000/api/v1/quality/check',
-        json=report_data
-    )
-    response.raise_for_status()
-    return response.json()
+# 创建报告
+report = Report(
+    ConclusionStr="右肺上叶占位性病变。",
+    ReportStr="左肺上叶可见占位性病变，大小约3cm。",
+    modality="CT",
+    StudyPart="胸部/肺平扫",
+    Sex="男",
+    applyTable=""
+)
 
-# 使用示例
-result = check_report({
-    'ConclusionStr': '双肺未见异常。',
-    'ReportStr': '双肺纹理增多。',
-    'modality': 'DR',
-    'StudyPart': '胸部',
-    'Sex': '男'
-})
+# 方式1: 使用环境变量控制 LLM（.env 中的 USE_LLM_VALIDATION）
+result = Report_Quality(report)
 
-if result['conclusion_missing']:
-    print(f"发现问题: {result['conclusion_missing']}")
+# 方式2: 强制启用 LLM（忽略环境变量）
+result = Report_Quality(report, llm=True)
+
+# 方式3: 强制禁用 LLM（忽略环境变量）
+result = Report_Quality(report, llm=False)
+
+# 方式4: 生成 HTML 预览
+result = Report_Quality(report, llm=False, html=True)
+print(f"HTML 文件: {result['_html_path']}")
+
+# 检查结果
+if result['orient_error']:
+    print(f"方位错误: {result['orient_error']}")
 ```
+
+### Report_Quality 参数说明
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `ReportTxt` | Report | - | 报告数据对象（必填） |
+| `debug` | bool | False | 是否打印详细耗时统计 |
+| `llm` | bool/None | None | LLM 开关，None=使用环境变量，True=强制开启，False=强制关闭 |
+| `html` | bool | False | 是否生成 HTML 预览文件 |
+
+### 返回值
+
+返回字典包含质控结果，当 `html=True` 时额外包含：
+- `_html_path`: 生成的 HTML 文件路径
+- `_timers`: 内部性能统计（调试用）
+
+## 📊 响应字段说明
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `partmissing` | list | 部位缺失检测 |
+| `partinverse` | list | 检查项目方位错误 |
+| `conclusion_missing` | list | 结论与描述不一致 |
+| `orient_error` | list | 方位错误（左右矛盾） |
+| `sex_error` | string | 性别错误（男女部位不符） |
+| `contradiction` | list | 语言矛盾（同一部位阴阳性矛盾） |
+| `measure_unit_error` | string | 测量值异常（mm/cm/m） |
+| `none_standard_term` | list | 术语不规范 |
+| `RADS` | string | RADS 分类检查（BI-RADS/PI-RADS） |
+| `Critical_value` | array | 危急值列表 |
+| `grammer_error` | array | 语法错误列表 |
+| `processing_time` | float | 处理耗时（秒） |
+| `llm_validated` | boolean | 是否经过 LLM 验证 |
+| `html_path` | string/null | HTML 预览文件路径（如果 generate_html=true） |
+
+### 字段值说明
+
+- **空字符串 `""`** 或 **空列表 `[]`**：未检测到问题
+- **有内容**：检测到问题，内容为具体描述
+- **带 `[弱阳性]` 前缀**：LLM 认为置信度较低，建议人工复核
 
 ## 🔧 配置说明
 
@@ -234,34 +284,17 @@ LLM_TIMEOUT=30
 LLM_CONFIDENCE_THRESHOLD=0.7
 ```
 
+### LLM 控制优先级
+
+1. **函数参数 `llm=True/False`**：最高优先级，强制覆盖环境变量
+2. **环境变量 `USE_LLM_VALIDATION`**：默认配置
+3. **不传递参数**：使用环境变量设置
+
 ### 配置文件
 
 - `config/system_config.ini` - 系统核心规则
 - `config/user_config.ini` - 用户自定义配置
 - `.env` - 环境变量配置
-
-## 📊 响应字段说明
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `partmissing` | string | 部位缺失检测 |
-| `conclusion_missing` | string | 描述与结论不一致 |
-| `orient_error` | string | 方位错误（左右矛盾） |
-| `sex_error` | string | 性别错误（男女部位不符） |
-| `contradiction` | string | 语言矛盾（同一部位阴阳性矛盾） |
-| `measure_unit_error` | string | 测量值异常（mm/cm/m） |
-| `none_standard_term` | string | 术语不规范 |
-| `RADS` | string | RADS 分类检查（BI-RADS/PI-RADS） |
-| `Critical_value` | array | 危急值列表 |
-| `grammer_error` | array | 语法错误列表 |
-| `processing_time` | float | 处理耗时（秒） |
-| `llm_validated` | boolean | 是否经过 LLM 验证 |
-
-### 字段值说明
-
-- **空字符串 `""`**：未检测到问题
-- **有内容**：检测到问题，内容为具体描述
-- **带 `[弱阳性]` 前缀**：LLM 认为置信度较低，建议人工复核
 
 ## 🏥 功能特性
 
@@ -284,17 +317,16 @@ LLM_CONFIDENCE_THRESHOLD=0.7
 ┌─────────────────────────────────────────────────────┐
 │                    API 服务层                        │
 │         (FastAPI + Pydantic + Uvicorn)              │
-└─────────────────────────────────────────────────────┘
-                          │
-┌─────────────────────────────────────────────────────┐
+├─────────────────────────────────────────────────────┤
+│                 HTML 预览生成                        │
+│         (Jinja2 模板 + 内联 CSS 样式)                │
+├─────────────────────────────────────────────────────┤
 │                    质控引擎层                        │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │
 │  │  规则引擎   │  │  Word2Vec  │  │  LLM 精筛   │ │
 │  │ (FlashText)│  │  (语义分析) │  │  (Qwen3)   │ │
 │  └─────────────┘  └─────────────┘  └─────────────┘ │
-└─────────────────────────────────────────────────────┘
-                          │
-┌─────────────────────────────────────────────────────┐
+├─────────────────────────────────────────────────────┤
 │                    数据层                           │
 │       (知识图谱 + 词向量模型 + 配置文件)              │
 └─────────────────────────────────────────────────────┘
@@ -344,11 +376,13 @@ CMD ["uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "8000"]
 | 标准检查（含 LLM） | 0.8-1.5s | 1-2 条/秒 |
 | 快速检查（无 LLM） | 0.2-0.5s | 5-10 条/秒 |
 | 批量检查（10条） | 8-15s | - |
+| 生成 HTML 预览 | +50-100ms | - |
 
 ## 🔒 安全与隐私
 
 - 系统仅处理文本数据，不存储患者影像
 - 报告内容在内存中处理，不保留历史记录
+- HTML 预览文件生成在本地，不上传到外部服务器
 - 支持离线部署，无外部数据传输
 - 危急值检测结果需人工复核确认
 

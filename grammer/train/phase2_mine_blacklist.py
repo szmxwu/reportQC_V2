@@ -23,7 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utils.config import (
     HUQIE_PATH, MEDICAL_DICT_PATHS,
-    RADIOLOGY_VOCAB, MEDICAL_CONFUSION, HIGH_RISK_GENERAL,
+    RADIOLOGY_VOCAB, MEDICAL_CONFUSION, HIGH_RISK_GENERAL, EXPANDED_CANDIDATES,
+    EXPAND_MIN_RADIO_FREQ, EXPAND_TWO_CHAR_THRESHOLD,
+    EXPAND_MAX_VARIANT_FREQ, EXPAND_MAX_CANDIDATES_PER_WRONG,
     MIN_WORD_LEN, MAX_WORD_LEN, MIN_HUQIE_FREQ, MAX_RADIO_FREQ,
     RISK_THRESHOLD, PRIORITY_POS, POS_WEIGHT, MED_PROTECT_WEIGHT,
     ensure_dirs
@@ -518,19 +520,125 @@ def save_high_risk_words(high_risk_words: List[Dict], output_path: str):
     print(f"高危词已保存: {output_path} ({len(high_risk_words)} 个)")
 
 
+def build_expanded_candidate_lexicon(
+    radio_vocab: Dict[str, int],
+    same_pinyin: Dict[str, Set[str]],
+    medical_vocab: Set[str],
+    min_radio_freq: int = EXPAND_MIN_RADIO_FREQ,
+    two_char_threshold: int = EXPAND_TWO_CHAR_THRESHOLD,
+    max_variant_freq: int = EXPAND_MAX_VARIANT_FREQ,
+    max_pinyin_distance: int = 2,
+    max_candidates_per_wrong: int = EXPAND_MAX_CANDIDATES_PER_WRONG,
+) -> Dict[str, List[Dict]]:
+    """构建离线候选词库，用于运行时 KenLM 精筛。
+
+    该词库与 medical_confusion.txt 分工不同：
+    - medical_confusion.txt 保留高置信、可直接命中的显式混淆对
+    - expanded_candidates.json 保留低证据/零证据但医学上合理的候选，交由运行时 KenLM 再筛
+    """
+    print("\n构建离线候选词库（供运行时 KenLM 精筛）...")
+
+    standard_words = [
+        (word, freq) for word, freq in radio_vocab.items()
+        if MIN_WORD_LEN <= len(word) <= MAX_WORD_LEN and freq >= min_radio_freq
+    ]
+    two_char_words = [
+        (word, freq) for word, freq in radio_vocab.items()
+        if len(word) == 2 and freq >= two_char_threshold and freq >= min_radio_freq
+    ]
+
+    seen = set()
+    candidate_words = []
+    for word, freq in standard_words + two_char_words:
+        if word in seen:
+            continue
+        seen.add(word)
+        candidate_words.append((word, freq))
+
+    candidate_words.sort(key=lambda x: x[1], reverse=True)
+
+    lexicon = defaultdict(list)
+    seen_pairs = set()
+
+    for correct_word, correct_freq in tqdm(candidate_words, desc="扩展候选"):
+        single_vars = generate_single_replacements(correct_word, same_pinyin)
+
+        for wrong_word in set(single_vars):
+            if wrong_word == correct_word:
+                continue
+            if contains_digit_or_english(wrong_word) or contains_digit_or_english(correct_word):
+                continue
+            if wrong_word in medical_vocab:
+                continue
+
+            wrong_freq = radio_vocab.get(wrong_word, 0)
+            if wrong_freq > max_variant_freq:
+                continue
+
+            correct_pinyin = get_pinyin(correct_word)
+            wrong_pinyin = get_pinyin(wrong_word)
+            distance = pinyin_edit_distance(correct_pinyin, wrong_pinyin)
+            if distance > max_pinyin_distance:
+                continue
+
+            key = (wrong_word, correct_word)
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+
+            offline_score = math.log((correct_freq + 1) / (wrong_freq + 1))
+
+            lexicon[wrong_word].append({
+                'suggestion': correct_word,
+                'wrong_freq': wrong_freq,
+                'correct_freq': correct_freq,
+                'offline_score': round(offline_score, 6),
+            })
+
+    trimmed_lexicon = {}
+    for wrong_word, candidates in lexicon.items():
+        candidates.sort(
+            key=lambda x: (x.get('offline_score', 0.0), x.get('correct_freq', 0)),
+            reverse=True,
+        )
+        trimmed_lexicon[wrong_word] = candidates[:max_candidates_per_wrong]
+
+    print(f"离线候选词条数: {len(trimmed_lexicon)}")
+    return trimmed_lexicon
+
+
+def save_expanded_candidates(candidate_lexicon: Dict[str, List[Dict]], output_path: str):
+    payload = {
+        'metadata': {
+            'version': 'v1',
+            'description': '供运行时 KenLM 精筛使用的离线候选词库',
+        },
+        'candidates': candidate_lexicon,
+    }
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"离线候选词库已保存: {output_path} ({len(candidate_lexicon)} 个错误词)")
+
+
 def mine_blacklist_v4(
     radio_vocab_path: str = None,
     huqie_path: str = None,
     medical_vocab_paths: List[Path] = None,
     output_confusion: str = None,
-    output_high_risk: str = None
-) -> Tuple[str, str]:
+    output_high_risk: str = None,
+    output_candidates: str = None,
+    min_radio_freq: int = EXPAND_MIN_RADIO_FREQ,
+    two_char_threshold: int = EXPAND_TWO_CHAR_THRESHOLD,
+    max_variant_freq: int = EXPAND_MAX_VARIANT_FREQ,
+    max_candidates_per_wrong: int = EXPAND_MAX_CANDIDATES_PER_WRONG,
+) -> Tuple[str, str, str]:
     """主函数"""
     radio_vocab_path = radio_vocab_path or str(RADIOLOGY_VOCAB)
     huqie_path = huqie_path or str(HUQIE_PATH)
     medical_vocab_paths = medical_vocab_paths or MEDICAL_DICT_PATHS
     output_confusion = output_confusion or str(MEDICAL_CONFUSION)
     output_high_risk = output_high_risk or str(HIGH_RISK_GENERAL)
+    output_candidates = output_candidates or str(EXPANDED_CANDIDATES)
     
     ensure_dirs()
     
@@ -562,8 +670,8 @@ def mine_blacklist_v4(
     # 策略 A（增强版）
     confusion_pairs = strategy_a_enhanced(
         radio_vocab, same_pinyin, medical_vocab,
-        min_radio_freq=100,
-        max_variant_freq=50,
+        min_radio_freq=min_radio_freq,
+        max_variant_freq=max_variant_freq,
         substring_vocab=substring_vocab,
         min_substring_freq=1
     )
@@ -572,18 +680,30 @@ def mine_blacklist_v4(
     high_risk_words = strategy_b_high_risk_general(
         huqie_vocab, radio_vocab, medical_vocab, confusion_pairs
     )
+
+    candidate_lexicon = build_expanded_candidate_lexicon(
+        radio_vocab=radio_vocab,
+        same_pinyin=same_pinyin,
+        medical_vocab=medical_vocab,
+        min_radio_freq=min_radio_freq,
+        two_char_threshold=two_char_threshold,
+        max_variant_freq=max_variant_freq,
+        max_candidates_per_wrong=max_candidates_per_wrong,
+    )
     
     # 保存
     save_confusion_pairs(confusion_pairs, output_confusion)
     save_high_risk_words(high_risk_words, output_high_risk)
+    save_expanded_candidates(candidate_lexicon, output_candidates)
     
     print("\n" + "=" * 70)
     print("阶段二完成！")
     print("=" * 70)
     print(f"混淆对: {len(confusion_pairs)} 对")
     print(f"高危词: {len(high_risk_words)} 个")
+    print(f"扩展候选: {len(candidate_lexicon)} 个错误词")
     
-    return output_confusion, output_high_risk
+    return output_confusion, output_high_risk, output_candidates
 
 
 if __name__ == '__main__':
@@ -593,16 +713,26 @@ if __name__ == '__main__':
     parser.add_argument('--huqie-path', default=str(HUQIE_PATH))
     parser.add_argument('--output-confusion', default=str(MEDICAL_CONFUSION))
     parser.add_argument('--output-high-risk', default=str(HIGH_RISK_GENERAL))
+    parser.add_argument('--output-candidates', default=str(EXPANDED_CANDIDATES))
+    parser.add_argument('--min-radio-freq', type=int, default=EXPAND_MIN_RADIO_FREQ)
+    parser.add_argument('--two-char-threshold', type=int, default=EXPAND_TWO_CHAR_THRESHOLD)
+    parser.add_argument('--max-variant-freq', type=int, default=EXPAND_MAX_VARIANT_FREQ)
+    parser.add_argument('--max-candidates-per-wrong', type=int, default=EXPAND_MAX_CANDIDATES_PER_WRONG)
     args = parser.parse_args()
     
-    confusion_file, high_risk_file = mine_blacklist_v4(
+    confusion_file, high_risk_file, candidates_file = mine_blacklist_v4(
         radio_vocab_path=args.radio_vocab,
         huqie_path=args.huqie_path,
         output_confusion=args.output_confusion,
-        output_high_risk=args.output_high_risk
+        output_high_risk=args.output_high_risk,
+        output_candidates=args.output_candidates,
+        min_radio_freq=args.min_radio_freq,
+        two_char_threshold=args.two_char_threshold,
+        max_variant_freq=args.max_variant_freq,
+        max_candidates_per_wrong=args.max_candidates_per_wrong,
     )
     
-    if confusion_file and high_risk_file:
+    if confusion_file and high_risk_file and candidates_file:
         print("\n挖掘成功！")
         sys.exit(0)
     else:
