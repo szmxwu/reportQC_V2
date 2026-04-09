@@ -234,4 +234,4 @@ output
 test
 kenlm
 origin
-training_data*.xlsx
+sentence_semantics
