@@ -235,3 +235,19 @@ test
 kenlm
 origin
 sentence_semantics
+# ========== 大文件忽略（GitHub 100MB限制）==========
+
+# grammer 模块超大文件
+grammer/models/radiology_corpus.txt      # 2.2GB 语料库
+grammer/models/radiology_ngram.arpa      # 123MB ARPA格式语言模型
+grammer/models/radiology_ngram.klm       # 84MB KLM格式语言模型
+grammer/models/expanded_candidates.json  # 28MB 扩展候选词表
+
+# model 目录超大向量文件
+model/finetuned_word2vec.m.wv.vectors.npy
+model/finetuned_word2vec.m.syn1neg.npy
+model/*.gz
+
+# V3 大数据文件
+V3/Auto_knowledgegraph/data/*.jsonl
+V3/Auto_knowledgegraph/data/*.json
