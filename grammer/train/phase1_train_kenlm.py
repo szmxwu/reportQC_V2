@@ -14,15 +14,15 @@ from pathlib import Path
 from glob import glob
 from typing import List, Tuple
 
-# 添加项目根目录
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# 添加 grammer 目录，确保可导入 utils/ssd_processor 等同级模块
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utils.config import (
     DATA_DIR, OUTPUT_DIR, TEMP_DIR,
     RADIOLOGY_CORPUS, RADIOLOGY_NGRAM, RADIOLOGY_VOCAB,
     NGRAM_ORDER, CHUNK_SIZE, ensure_dirs
 )
-from ssd_processor import SSDStreamingProcessor
+from train.ssd_processor import SSDStreamingProcessor
 
 
 def find_excel_files(data_dir: str) -> List[Path]:
@@ -66,21 +66,28 @@ def train_kenlm_model(corpus_file: str, output_model: str, order: int = NGRAM_OR
     # 步骤 1: 生成 ARPA 格式模型
     arpa_file = output_model.replace('.klm', '.arpa')
     
+    def _build_lmplz_cmd(prune: List[str], use_discount_fallback: bool) -> List[str]:
+        cmd = [
+            'lmplz',
+            '-o', str(order),
+            '--prune', *prune,
+            '--text', corpus_file,
+            '--arpa', arpa_file
+        ]
+        if use_discount_fallback:
+            cmd.append('--discount_fallback')
+        return cmd
+
     # 构建 lmplz 命令
     # --prune: 剪枝，减少模型大小
     # 0 0 1 表示保留所有 1-gram 和 2-gram，对 3-gram 及以上进行剪枝
-    cmd = [
-        'lmplz',
-        '-o', str(order),
-        '--prune', '0', '0', '1',
-        '--text', corpus_file,
-        '--arpa', arpa_file
-    ]
-    
+    prune_args = ['0', '0', '1']
+    cmd = _build_lmplz_cmd(prune_args, use_discount_fallback=False)
+
     print(f"运行命令: {' '.join(cmd)}")
-    
+
     try:
-        result = subprocess.run(
+        subprocess.run(
             cmd,
             capture_output=True,
             text=True,
@@ -88,9 +95,28 @@ def train_kenlm_model(corpus_file: str, output_model: str, order: int = NGRAM_OR
         )
         print("ARPA 模型生成成功")
     except subprocess.CalledProcessError as e:
-        print(f"ARPA 模型生成失败: {e}")
-        print(f"错误输出: {e.stderr}")
-        return False
+        stderr_text = e.stderr or ''
+        is_bad_discount = 'BadDiscountException' in stderr_text or '--discount_fallback' in stderr_text
+        if is_bad_discount:
+            retry_cmd = _build_lmplz_cmd(prune_args, use_discount_fallback=True)
+            print("检测到 Kneser-Ney 折扣异常，自动重试并启用 --discount_fallback")
+            print(f"重试命令: {' '.join(retry_cmd)}")
+            try:
+                subprocess.run(
+                    retry_cmd,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                print("ARPA 模型生成成功（使用 --discount_fallback）")
+            except subprocess.CalledProcessError as retry_error:
+                print(f"ARPA 模型生成失败: {retry_error}")
+                print(f"错误输出: {retry_error.stderr}")
+                return False
+        else:
+            print(f"ARPA 模型生成失败: {e}")
+            print(f"错误输出: {stderr_text}")
+            return False
     except FileNotFoundError:
         print("错误: 未找到 lmplz 命令。请确保 kenlm 已正确安装")
         print("安装方法: pip install kenlm")
@@ -137,6 +163,8 @@ def train_kenlm(
     data_dir: str = None,
     output_model: str = None,
     output_vocab: str = None,
+    prepared_corpus: str = None,
+    prepared_vocab: str = None,
     text_columns: List[str] = None,
     ngram_order: int = None,
     chunk_size: int = None
@@ -169,6 +197,27 @@ def train_kenlm(
     print("=" * 70)
     print("阶段一：KenLM N-gram 训练 + 分词词频统计")
     print("=" * 70)
+
+    if prepared_corpus:
+        print(f"使用准备好的语料: {prepared_corpus}")
+        print(f"N-gram 阶数: {ngram_order}")
+        if prepared_vocab:
+            print(f"使用准备好的词频文件: {prepared_vocab}")
+        success = train_kenlm_model(prepared_corpus, output_model, ngram_order)
+        if success:
+            print("\n" + "=" * 70)
+            print("阶段一完成！")
+            print("=" * 70)
+            print(f"KenLM 模型: {output_model}")
+            if prepared_vocab:
+                print(f"词频统计: {prepared_vocab}")
+            return output_model, prepared_vocab
+
+        print("\n" + "=" * 70)
+        print("阶段一失败！")
+        print("=" * 70)
+        return None, prepared_vocab
+
     print(f"数据目录: {data_dir}")
     print(f"N-gram 阶数: {ngram_order}")
     print(f"分块大小: {chunk_size}")
@@ -242,6 +291,10 @@ if __name__ == '__main__':
                        help='输出 KenLM 模型路径')
     parser.add_argument('--output-vocab', default=str(RADIOLOGY_VOCAB),
                        help='输出词频文件路径')
+    parser.add_argument('--prepared-corpus',
+                       help='直接使用准备好的语料文件训练 KenLM，跳过 Excel 扫描')
+    parser.add_argument('--prepared-vocab',
+                       help='与 prepared-corpus 对应的词频文件路径')
     parser.add_argument('--ngram-order', type=int, default=NGRAM_ORDER,
                        help=f'N-gram 阶数（默认{NGRAM_ORDER}）')
     parser.add_argument('--chunk-size', type=int, default=CHUNK_SIZE,
@@ -255,6 +308,8 @@ if __name__ == '__main__':
         data_dir=args.data_dir,
         output_model=args.output_model,
         output_vocab=args.output_vocab,
+        prepared_corpus=args.prepared_corpus,
+        prepared_vocab=args.prepared_vocab,
         ngram_order=args.ngram_order,
         chunk_size=args.chunk_size
     )

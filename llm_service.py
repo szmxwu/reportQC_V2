@@ -293,6 +293,76 @@ class LLMValidator:
         except Exception as e:
             print(f"LLM validation error: {e}")
             return (True, 0.0, f"LLM验证失败: {str(e)}")
+
+    def validate_grammar_error(
+        self,
+        grammar_type: str,
+        sentence: str,
+        error_phrase: str,
+        suggestion: Optional[str] = None,
+        full_text: str = '',
+        rule_score: Optional[float] = None,
+        rule_source: str = '',
+    ) -> Tuple[bool, float, str]:
+        """验证 grammer 子系统命中的候选是否为真阳性。"""
+        cache_key = (
+            f"ge:{grammar_type}:{hash(sentence + error_phrase + (suggestion or '') + full_text[:120])}"
+        )
+        if cache_key in self._cache:
+            self._cache_hits += 1
+            return self._cache[cache_key]
+        self._cache_misses += 1
+
+        rule_score_str = "" if rule_score is None else str(rule_score)
+        suggestion_str = suggestion or ""
+        prompt = f"""你是一位医学影像报告质控专家。请判断下面的语法错误候选是否应该被保留。
+
+【错误类型】
+{grammar_type}
+
+【命中短句】
+{sentence}
+
+【疑似错误短语】
+{error_phrase}
+
+【建议修正】
+{suggestion_str}
+
+【规则来源】
+{rule_source}
+
+【规则分数】
+{rule_score_str}
+
+【原始全文】
+{full_text}
+
+【判定要求】
+1. 若错误类型是 typo：判断该短语是否真的是医学影像报告中的错别字或拼音混淆，且建议修正是否正确。
+2. 若错误类型是 general_high_risk：判断该短语是否属于通用语料高频、但放射报告里不应出现或极不自然的高危词；如果它在当前句子中是正常医学表达、机构简称、设备名、病史引用或固定搭配，则不要保留。
+3. 若错误类型是 word_order：判断该短语在当前医学影像报告语境下是否存在明显词序错误；如果只是另一种常见表达、模板省略或上下文不足，则不要保留。
+4. 重点降低误报，但不要无原则放过明显错误。
+
+请以 JSON 输出：
+{{"is_valid": true/false, "confidence": 0.0-1.0, "reason": "简要原因"}}"""
+
+        try:
+            result = self._call_llm(prompt)
+            parsed = self._parse_json_response(result)
+
+            is_valid = bool(parsed.get('is_valid', True))
+            confidence = float(parsed.get('confidence', 0.5))
+            reason = str(parsed.get('reason', ''))
+
+            result_tuple = (is_valid, confidence, reason)
+            if len(self._cache) < self._cache_size:
+                self._cache[cache_key] = result_tuple
+            return result_tuple
+
+        except Exception as e:
+            print(f"LLM grammar validation error: {e}")
+            return (True, 0.0, f"LLM验证失败: {str(e)}")
     
     def _validate_single(self, candidate: Dict) -> Optional[Dict]:
         """
@@ -392,6 +462,59 @@ class LLMValidator:
                 if result is not None:
                     validated.append(result)
         
+        return validated
+
+    def batch_validate_grammar_candidates(self, candidates: List[Dict]) -> List[Dict]:
+        """批量验证 grammer 子系统候选。"""
+        if not self.use_llm or not self.available():
+            return candidates
+
+        if not candidates:
+            return []
+
+        validated = []
+
+        def _validate_candidate(candidate: Dict) -> Optional[Dict]:
+            try:
+                is_valid, conf, reason = self.validate_grammar_error(
+                    grammar_type=candidate.get('grammar_type', ''),
+                    sentence=candidate.get('sentence', ''),
+                    error_phrase=candidate.get('error_phrase', ''),
+                    suggestion=candidate.get('suggestion'),
+                    full_text=candidate.get('full_text', ''),
+                    rule_score=candidate.get('rule_score'),
+                    rule_source=candidate.get('rule_source', ''),
+                )
+
+                if conf == 0.0 and "LLM验证失败" in reason:
+                    candidate['needs_review'] = True
+                    candidate['review_reason'] = reason
+                    return candidate
+                if is_valid and conf >= self.confidence_threshold:
+                    candidate['confidence'] = conf
+                    candidate['llm_reason'] = reason
+                    return candidate
+                if is_valid and conf >= 0.5:
+                    candidate['confidence'] = conf
+                    candidate['llm_reason'] = reason
+                    candidate['weak_positive'] = True
+                    return candidate
+                return None
+            except Exception as e:
+                candidate['needs_review'] = True
+                candidate['review_reason'] = f"验证异常: {str(e)}"
+                return candidate
+
+        with ThreadPoolExecutor(max_workers=self.batch_size) as executor:
+            future_to_candidate = {
+                executor.submit(_validate_candidate, candidate): candidate
+                for candidate in candidates
+            }
+            for future in as_completed(future_to_candidate):
+                result = future.result()
+                if result is not None:
+                    validated.append(result)
+
         return validated
     
     def _call_llm(self, prompt: str) -> str:

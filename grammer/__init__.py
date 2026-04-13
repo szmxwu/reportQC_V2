@@ -24,7 +24,7 @@
 
 __version__ = '3.0.0'
 
-from inference.medical_typo_detector import MedicalTypoDetector
-from inference.word_order_detector import WordOrderDetector
+from .inference.medical_typo_detector import MedicalTypoDetector
+from .inference.word_order_detector import WordOrderDetector
 
 __all__ = ['MedicalTypoDetector', 'WordOrderDetector']

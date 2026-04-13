@@ -20,8 +20,7 @@ from utils.config import (
     WORD_ORDER_TEMPLATES, AC_AUTOMATON,
     ensure_dirs
 )
-from train.phase3_build_engine_v2 import FastMedicalCorrectorV2
-from inference.word_order_detector import WordOrderDetector
+from inference.detect_real_data_final import MedicalTypoDetectorFinal
 
 
 class MedicalTypoDetector:
@@ -57,52 +56,12 @@ class MedicalTypoDetector:
         self.engine_path = engine_path or str(AC_AUTOMATON)
         self.word_order_path = word_order_path or str(WORD_ORDER_TEMPLATES)
         self.enable_word_order = enable_word_order
-        
-        # 内部引擎
-        self._corrector = None
-        self._word_order_detector = None
-        self._lm_loaded = False
+        self._delegate = MedicalTypoDetectorFinal()
     
     def load(self):
         """加载检测引擎"""
         ensure_dirs()
-        
-        self._corrector = FastMedicalCorrectorV2()
-        
-        # 优先加载预构建引擎
-        engine_file = Path(self.engine_path)
-        if engine_file.exists():
-            print(f"加载预构建引擎: {self.engine_path}")
-            self._corrector.load(self.engine_path)
-        else:
-            # 从黑名单文件构建
-            print("从黑名单文件构建引擎...")
-            self._corrector.load_blacklists(
-                self.confusion_path,
-                self.high_risk_path
-            )
-            # 保存供下次使用
-            self._corrector.save(self.engine_path)
-        
-        # 加载词序检测器
-        if self.enable_word_order and Path(self.word_order_path).exists():
-            self._word_order_detector = WordOrderDetector(self.word_order_path)
-        
-        # 尝试加载 KenLM（可选，用于纠错功能）
-        try:
-            from pycorrector import Corrector
-            if Path(self.lm_path).exists():
-                self._lm = Corrector(language_model_path=self.lm_path)
-                self._lm_loaded = True
-                print(f"KenLM 模型已加载: {self.lm_path}")
-            else:
-                print(f"KenLM 模型不存在（可选）: {self.lm_path}")
-                print("提示: 检测功能仍可正常工作，纠错功能将使用基于规则的修正")
-                self._lm_loaded = False
-        except Exception as e:
-            print(f"KenLM 加载失败（可选）: {e}")
-            print("提示: 检测功能仍可正常工作")
-            self._lm_loaded = False
+        self._delegate.load()
     
     def scan(self, text: str) -> List[Dict]:
         """
@@ -121,40 +80,20 @@ class MedicalTypoDetector:
             - position: (start, end) 位置
             - score: 风险分数（仅高危词）或置信度（词序错误）
         """
-        if self._corrector is None:
+        if self._delegate.corrector is None:
             self.load()
-        
-        # 1. AC自动机检测（拼音混淆 + 高危词）
-        matches = self._corrector.scan(text)
-        errors = [
-            {
-                'error': m.error,
-                'suggestion': m.suggestion,
-                'type': m.error_type,
-                'position': m.position,
-                'score': m.score if m.error_type == 'general_high_risk' else None
-            }
-            for m in matches
-        ]
-        
-        # 2. 词序错误检测
-        if self._word_order_detector:
-            word_order_errors = self._word_order_detector.detect(text)
-            for e in word_order_errors:
-                errors.append({
-                    'error': e['error'],
-                    'suggestion': e['suggestion'],
-                    'type': 'word_order',
-                    'position': e['position'],
-                    'score': e['confidence'],  # 用置信度作为score
-                    'forward_freq': e.get('forward_freq'),
-                    'backward_freq': e.get('backward_freq')
-                })
-        
-        # 按位置排序
-        errors.sort(key=lambda x: x['position'][0])
-        
-        return errors
+        normalized = []
+        for err in self._delegate.detect(text, apply_llm_validation=False):
+            normalized.append({
+                'error': err.get('error'),
+                'suggestion': err.get('suggestion'),
+                'type': err.get('type'),
+                'position': (err['position']['start'], err['position']['end']),
+                'score': err.get('score'),
+                'context': err.get('context'),
+                'rule_source': err.get('rule_source'),
+            })
+        return normalized
     
     def correct(self, text: str) -> Dict:
         """
@@ -177,10 +116,30 @@ class MedicalTypoDetector:
                 ]
             }
         """
-        if self._corrector is None:
+        if self._delegate.corrector is None:
             self.load()
-        
-        return self._corrector.correct(text)
+
+        matches = self.scan(text)
+        target = text
+        replacements = []
+        for item in sorted(matches, key=lambda x: -x['position'][0]):
+            suggestion = item.get('suggestion')
+            if not suggestion:
+                continue
+            start, end = item['position']
+            target = target[:start] + suggestion + target[end:]
+            replacements.append({
+                'error': item['error'],
+                'suggestion': suggestion,
+                'type': item['type'],
+                'position': item['position'],
+            })
+
+        return {
+            'source': text,
+            'target': target,
+            'errors': list(reversed(replacements)),
+        }
     
     def detect(self, text: str) -> List[Dict]:
         """
@@ -204,21 +163,20 @@ class MedicalTypoDetector:
         Returns:
             每个文本的错误列表
         """
-        if self._corrector is None:
+        if self._delegate.corrector is None:
             self.load()
-        
         return [self.scan(text) for text in texts]
     
     def get_stats(self) -> Dict:
         """获取检测器统计信息"""
-        if self._corrector is None:
+        if self._delegate.corrector is None:
             return {'loaded': False}
-        
-        stats = self._corrector.get_stats()
-        stats['lm_loaded'] = self._lm_loaded
-        stats['word_order_enabled'] = self._word_order_detector is not None
-        if self._word_order_detector:
-            stats['word_order_patterns'] = len(self._word_order_detector.word_patterns)
+
+        stats = self._delegate.corrector.get_stats()
+        stats['lm_loaded'] = self._delegate.lm_model is not None
+        stats['word_order_enabled'] = self._delegate.word_order_detector is not None
+        if self._delegate.word_order_detector:
+            stats['word_order_patterns'] = len(self._delegate.word_order_detector.word_patterns)
         return stats
 
 
@@ -274,9 +232,9 @@ def run_full_pipeline(
     Returns:
         配置好的 MedicalTypoDetector 实例
     """
-    from phase1_train_kenlm import train_kenlm
-    from phase2_mine_blacklist import mine_blacklist
-    from phase3_build_engine import build_engine
+    from train.phase1_train_kenlm import train_kenlm
+    from train.phase2_mine_blacklist import mine_blacklist_v4
+    from train.phase3_build_engine_v2 import build_engine_v2
     
     print("=" * 70)
     print("医学错别字检测 - 完整流程")
@@ -292,7 +250,7 @@ def run_full_pipeline(
     
     # 阶段二：黑名单挖掘
     if not skip_phase2:
-        confusion_file, high_risk_file = mine_blacklist()
+        confusion_file, high_risk_file, _ = mine_blacklist_v4()
         if not confusion_file or not high_risk_file:
             raise RuntimeError("阶段二失败：无法生成黑名单")
     else:
@@ -300,7 +258,7 @@ def run_full_pipeline(
     
     # 阶段三：引擎构建
     if not skip_phase3:
-        build_engine()
+        build_engine_v2()
     else:
         print("跳过阶段三（使用现有引擎）")
     

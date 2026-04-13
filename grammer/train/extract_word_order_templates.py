@@ -158,6 +158,8 @@ def extract_word_order_patterns(word_freq: Dict[str, int]) -> List[Dict]:
                     'correct': word,
                     'error': reverse,
                     'type': '2+2',
+                    'part1': part1,
+                    'part2': part2,
                     'correct_freq': freq,
                     'error_freq': reverse_freq,
                     'ratio': freq / (reverse_freq + 1)
@@ -175,6 +177,8 @@ def extract_word_order_patterns(word_freq: Dict[str, int]) -> List[Dict]:
                     'correct': word,
                     'error': reverse,
                     'type': '1+2',
+                    'part1': part1,
+                    'part2': part2,
                     'correct_freq': freq,
                     'error_freq': reverse_freq,
                     'ratio': freq / (reverse_freq + 1)
@@ -190,6 +194,8 @@ def extract_word_order_patterns(word_freq: Dict[str, int]) -> List[Dict]:
                     'correct': word,
                     'error': reverse,
                     'type': '2+1',
+                    'part1': part1,
+                    'part2': part2,
                     'correct_freq': freq,
                     'error_freq': reverse_freq,
                     'ratio': freq / (reverse_freq + 1)

@@ -562,8 +562,14 @@ def build_expanded_candidate_lexicon(
 
     for correct_word, correct_freq in tqdm(candidate_words, desc="扩展候选"):
         single_vars = generate_single_replacements(correct_word, same_pinyin)
+        double_vars = generate_double_replacements(
+            correct_word,
+            same_pinyin,
+            max_combinations=40,
+            max_chars_per_position=10,
+        )
 
-        for wrong_word in set(single_vars):
+        for wrong_word in set(single_vars + double_vars):
             if wrong_word == correct_word:
                 continue
             if contains_digit_or_english(wrong_word) or contains_digit_or_english(correct_word):

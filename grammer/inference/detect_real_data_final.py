@@ -6,6 +6,7 @@
 """
 
 import json
+import os
 import re
 import sys
 import time
@@ -15,11 +16,101 @@ from typing import List, Dict, Tuple, Optional
 import jieba
 import pandas as pd
 from tqdm import tqdm
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 GRAMMER_ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = GRAMMER_ROOT / 'models'
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+_DEFAULT_RUNTIME_THRESHOLDS = {
+    'typo_lm_reject_delta': 0.20,
+    'expand_accept_delta': 0.15,
+    'high_risk_min_score': 6.0,
+    'word_order_min_confidence': 150.0,
+}
+
+
+def _load_env_once() -> None:
+    env_path = REPO_ROOT / '.env'
+    if env_path.exists():
+        load_dotenv(env_path, override=False)
+
+
+def _load_best_runtime_thresholds(best_path: Path) -> Dict[str, float]:
+    if not best_path.exists():
+        return {}
+
+    try:
+        raw = best_path.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        return {}
+
+    marker = 'best='
+    idx = raw.rfind(marker)
+    if idx < 0:
+        return {}
+
+    payload = raw[idx + len(marker):].strip()
+    if not payload:
+        return {}
+
+    first_line = payload.splitlines()[0].strip()
+    if not first_line:
+        return {}
+
+    try:
+        best = json.loads(first_line)
+    except Exception:
+        return {}
+
+    result = {}
+    for key in _DEFAULT_RUNTIME_THRESHOLDS:
+        value = best.get(key)
+        if value is None:
+            continue
+        try:
+            result[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _resolve_runtime_thresholds() -> Tuple[Dict[str, float], str]:
+    _load_env_once()
+
+    thresholds = dict(_DEFAULT_RUNTIME_THRESHOLDS)
+    source = 'builtin_defaults'
+
+    best_file = REPO_ROOT / 'output' / 'grammer_runtime_thresholds_llm.md'
+    best_thresholds = _load_best_runtime_thresholds(best_file)
+    if best_thresholds:
+        thresholds.update(best_thresholds)
+        source = f'best_file:{best_file}'
+
+    env_mapping = {
+        'GRAMMER_TYPO_LM_REJECT_DELTA': 'typo_lm_reject_delta',
+        'GRAMMER_EXPAND_ACCEPT_DELTA': 'expand_accept_delta',
+        'GRAMMER_HIGH_RISK_MIN_SCORE': 'high_risk_min_score',
+        'GRAMMER_WORD_ORDER_MIN_CONFIDENCE': 'word_order_min_confidence',
+    }
+    env_overrides = 0
+    for env_name, key in env_mapping.items():
+        raw = os.getenv(env_name)
+        if raw is None or raw == '':
+            continue
+        try:
+            thresholds[key] = float(raw)
+            env_overrides += 1
+        except ValueError:
+            continue
+
+    if env_overrides:
+        source = f'{source}+env_overrides'
+
+    return thresholds, source
 
 from train.phase3_build_engine_v2 import FastMedicalCorrectorV2
 from inference.word_order_detector import WordOrderDetector
@@ -91,16 +182,32 @@ class MedicalTypoDetectorFinal:
         self.corrector = None
         self.word_order_detector = None
         self.lm_model = None
-        self.typo_lm_reject_delta = 0.30
-        self.expand_min_suggest_freq = 50
-        self.expand_accept_delta = 0.20
+        thresholds, threshold_source = _resolve_runtime_thresholds()
+        self.typo_lm_reject_delta = thresholds['typo_lm_reject_delta']
+        self.expand_min_suggest_freq = int(os.getenv('GRAMMER_EXPAND_MIN_SUGGEST_FREQ', '50'))
+        self.expand_accept_delta = thresholds['expand_accept_delta']
+        self.high_risk_min_score = thresholds['high_risk_min_score']
+        self.word_order_min_confidence = thresholds['word_order_min_confidence']
+        self.runtime_threshold_source = threshold_source
+        self.enable_llm_validation = os.getenv('USE_LLM_VALIDATION', 'false').lower() == 'true'
         self._lm_score_cache = {}
         self.char_subst_map = {}
         self.radiology_vocab_freq = {}
         self.candidate_lexicon = {}
+        self.llm_validator = None
+        self._llm_checked = False
     
     def load(self):
         """加载引擎"""
+        print(
+            "语法阈值加载: "
+            f"source={self.runtime_threshold_source}, "
+            f"typo_delta={self.typo_lm_reject_delta:.2f}, "
+            f"expand_delta={self.expand_accept_delta:.2f}, "
+            f"high_risk_min={self.high_risk_min_score:.2f}, "
+            f"word_order_min={self.word_order_min_confidence:.0f}"
+        )
+
         # 加载拼音/高危词检测器
         self.corrector = FastMedicalCorrectorV2()
         
@@ -150,8 +257,31 @@ class MedicalTypoDetectorFinal:
                 self.candidate_lexicon = candidate_data.get('candidates', {})
         except Exception as e:
             print(f"离线候选词库加载失败，将回退到动态生成: {e}")
+
+        self._get_llm_validator()
         
         print("检测器加载完成")
+
+    def _get_llm_validator(self):
+        if not self.enable_llm_validation:
+            return None
+        if self._llm_checked:
+            return self.llm_validator
+
+        self._llm_checked = True
+        try:
+            from llm_service import get_llm_validator
+
+            validator = get_llm_validator()
+            if validator.available():
+                self.llm_validator = validator
+            else:
+                self.llm_validator = None
+        except Exception as e:
+            print(f"语法错误 LLM 验证器不可用，回退到规则结果: {e}")
+            self.llm_validator = None
+
+        return self.llm_validator
 
     @staticmethod
     def _extract_chinese_chars(text: str) -> List[str]:
@@ -238,18 +368,18 @@ class MedicalTypoDetectorFinal:
 
         return list(candidates)
 
-    def _select_best_expanded_candidate(self, text: str, token: str, start: int, end: int) -> str:
+    def _select_best_expanded_candidate_details(self, text: str, token: str, start: int, end: int) -> Tuple[str, float]:
         """用 KenLM 选择最优候选；仅当候选上下文显著优于原词时接受。"""
         if not self.lm_model:
-            return ''
+            return '', 0.0
 
         prev_word, next_word = self._get_prev_next_word(text, start, end)
         if not prev_word and not next_word:
-            return ''
+            return '', 0.0
 
         candidates = self._generate_expanded_candidates(token)
         if not candidates:
-            return ''
+            return '', 0.0
 
         original_context = f"{prev_word}{token}{next_word}"
         original_score = self._kenlm_score(original_context)
@@ -265,8 +395,12 @@ class MedicalTypoDetectorFinal:
                 best_cand = cand
 
         if best_cand and best_delta >= self.expand_accept_delta:
-            return best_cand
-        return ''
+            return best_cand, best_delta
+        return '', best_delta
+
+    def _select_best_expanded_candidate(self, text: str, token: str, start: int, end: int) -> str:
+        suggestion, _ = self._select_best_expanded_candidate_details(text, token, start, end)
+        return suggestion
 
     def _get_prev_next_word(self, text: str, start: int, end: int) -> Tuple[str, str]:
         tokens = self._tokenize_with_positions(text)
@@ -310,8 +444,64 @@ class MedicalTypoDetectorFinal:
         if delta <= -self.typo_lm_reject_delta:
             return False
         return True
+
+    def _validate_errors_with_llm(
+        self,
+        text: str,
+        errors: List[Dict],
+        source_field: str = '',
+    ) -> List[Dict]:
+        validator = self._get_llm_validator()
+        if not validator or not errors:
+            return errors
+
+        candidates = []
+        for idx, err in enumerate(errors):
+            score = err.get('score')
+            if score is None:
+                score = err.get('confidence')
+            candidates.append({
+                'type': 'grammar_error',
+                'grammar_type': err.get('type', ''),
+                'sentence': err.get('context', ''),
+                'full_text': text,
+                'error_phrase': err.get('error', ''),
+                'suggestion': err.get('suggestion'),
+                'rule_score': score,
+                'rule_source': err.get('rule_source', ''),
+                'source_field': source_field,
+                'index': idx,
+            })
+
+        validated = validator.batch_validate_grammar_candidates(candidates)
+        if not validated:
+            return []
+
+        validated_map = {item['index']: item for item in validated}
+        filtered = []
+        for idx, err in enumerate(errors):
+            llm_result = validated_map.get(idx)
+            if llm_result is None:
+                continue
+            if 'confidence' in llm_result:
+                err['llm_confidence'] = llm_result['confidence']
+            if llm_result.get('llm_reason'):
+                err['llm_reason'] = llm_result['llm_reason']
+            if llm_result.get('weak_positive'):
+                err['weak_positive'] = True
+            if llm_result.get('needs_review'):
+                err['needs_review'] = True
+                err['review_reason'] = llm_result.get('review_reason', '')
+            filtered.append(err)
+
+        return filtered
     
-    def detect(self, text: str) -> List[Dict]:
+    def detect(
+        self,
+        text: str,
+        apply_llm_validation: Optional[bool] = None,
+        source_field: str = '',
+    ) -> List[Dict]:
         """检测文本（过滤掉包含数字或英文的错误）"""
         if not text or not isinstance(text, str):
             return []
@@ -327,6 +517,9 @@ class MedicalTypoDetectorFinal:
                 if contains_digit_or_english(m.error):
                     continue
                 if m.suggestion and contains_digit_or_english(m.suggestion):
+                    continue
+
+                if m.error_type == 'general_high_risk' and (m.score or 0.0) < self.high_risk_min_score:
                     continue
 
                 if m.error_type == 'typo' and m.suggestion:
@@ -346,7 +539,8 @@ class MedicalTypoDetectorFinal:
                     'type': m.error_type,
                     'position': {'start': m.position[0], 'end': m.position[1]},
                     'context': context,
-                    'score': m.score
+                    'score': m.score,
+                    'rule_source': 'direct_confusion' if m.error_type == 'typo' else 'high_risk_lexicon',
                 })
                 matched_spans.add((m.position[0], m.position[1]))
 
@@ -359,7 +553,7 @@ class MedicalTypoDetectorFinal:
                 if not self._is_chinese_token(token):
                     continue
 
-                best_suggestion = self._select_best_expanded_candidate(text, token, start, end)
+                best_suggestion, best_delta = self._select_best_expanded_candidate_details(text, token, start, end)
                 if not best_suggestion:
                     continue
 
@@ -370,7 +564,8 @@ class MedicalTypoDetectorFinal:
                     'type': 'typo',
                     'position': {'start': start, 'end': end},
                     'context': context,
-                    'score': None,
+                    'score': round(best_delta, 6),
+                    'rule_source': 'expanded_candidate',
                 })
         
         # 2. 词序错误检测
@@ -380,6 +575,8 @@ class MedicalTypoDetectorFinal:
                 context = e.get('context') or find_error_context(text, e['position'][0], e['position'][1])
 
                 if not is_sufficient_word_order_context(context, e['error']):
+                    continue
+                if e.get('confidence', 0.0) < self.word_order_min_confidence:
                     continue
 
                 # 检查是否已存在（避免重复）
@@ -395,11 +592,18 @@ class MedicalTypoDetectorFinal:
                         'type': 'word_order',
                         'position': {'start': pos[0], 'end': pos[1]},
                         'context': context,
-                        'confidence': e.get('confidence')
+                        'confidence': e.get('confidence'),
+                        'score': e.get('confidence'),
+                        'rule_source': 'word_order_template',
                     })
         
         # 按位置排序
         errors.sort(key=lambda x: x['position']['start'])
+
+        if apply_llm_validation is None:
+            apply_llm_validation = self.enable_llm_validation
+        if apply_llm_validation:
+            errors = self._validate_errors_with_llm(text, errors, source_field=source_field)
         
         return errors
 
@@ -418,7 +622,11 @@ def _get_detector_singleton() -> MedicalTypoDetectorFinal:
     return _DETECTOR_SINGLETON
 
 
-def detect_grammer_errors(report_text: str, conclusion_text: str) -> List[Dict]:
+def detect_grammer_errors(
+    report_text: str,
+    conclusion_text: str,
+    apply_llm_validation: Optional[bool] = None,
+) -> List[Dict]:
     """统一语法错误检测入口，供主流程直接调用。"""
     detector = _get_detector_singleton()
     results: List[Dict] = []
@@ -432,7 +640,11 @@ def detect_grammer_errors(report_text: str, conclusion_text: str) -> List[Dict]:
         if not text.strip():
             continue
 
-        for err in detector.detect(text):
+        for err in detector.detect(
+            text,
+            apply_llm_validation=apply_llm_validation,
+            source_field=source_field,
+        ):
             results.append(
                 {
                     "source_field": source_field,
@@ -440,6 +652,10 @@ def detect_grammer_errors(report_text: str, conclusion_text: str) -> List[Dict]:
                     "sentence": err.get("context", ""),
                     "error_category": err.get("type", ""),
                     "suggestion": err.get("suggestion"),
+                    "score": err.get("score"),
+                    "rule_source": err.get("rule_source"),
+                    "llm_confidence": err.get("llm_confidence"),
+                    "llm_reason": err.get("llm_reason"),
                 }
             )
 

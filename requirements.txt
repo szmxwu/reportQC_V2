@@ -17,6 +17,8 @@ scipy>=1.10.0
 
 # HTTP 客户端（LLM 调用需要）
 httpx>=0.25.0
+requests>=2.31.0
+json-repair>=0.30.0
 
 # 可选：生产环境
 # gunicorn>=21.0.0

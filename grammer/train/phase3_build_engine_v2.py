@@ -40,10 +40,32 @@ class FastMedicalCorrectorV2:
         self.high_risk_words: Dict[str, float] = {}  # 高危词 -> 风险分
         self.loaded = False
         self.user_dict_loaded = False
+        self.max_high_risk_window_tokens = 3
+        self.max_high_risk_window_chars = 10
+        self.generic_entity_suffixes = {
+            '公司', '集团', '有限责任公司', '有限公司', '股份有限公司',
+            '医院', '大学', '学院', '学校', '银行', '中心'
+        }
         self.blocked_single_char_combine_chars = {
             '及', '和', '与', '或', '并', '后', '前', '约', '内', '外',
             '左', '右', '双', '上', '下', '中', '未', '无', '见', '起'
         }
+
+    def _match_high_risk_compound(self, token: str) -> Optional[Tuple[str, float]]:
+        """识别“高危专名 + 通用机构后缀”的复合词，避免整词分词导致漏检。"""
+        if len(token) < 4:
+            return None
+
+        for suffix in self.generic_entity_suffixes:
+            if not token.endswith(suffix):
+                continue
+            base = token[:-len(suffix)]
+            if len(base) < 3:
+                continue
+            score = self.high_risk_words.get(base)
+            if score is not None:
+                return token, score
+        return None
 
     def _load_user_dict(self):
         """加载医学词典，改善放射文本分词边界。"""
@@ -119,7 +141,7 @@ class FastMedicalCorrectorV2:
             raise RuntimeError("引擎未构建，请先调用build()")
         
         matches = []
-        matched_positions = set()
+        matched_ranges = set()
         
         # 策略1：分词后匹配
         tokens = self._tokenize_with_positions(text)
@@ -131,14 +153,40 @@ class FastMedicalCorrectorV2:
             
             # 情况A：整个词在混淆对中
             if word in self.confusion_pairs:
-                if start not in matched_positions:
+                if (start, end) not in matched_ranges:
                     matches.append(MatchResult(
                         error=word,
                         suggestion=self.confusion_pairs[word],
                         error_type='typo',
                         position=(start, end)
                     ))
-                    matched_positions.add(start)
+                    matched_ranges.add((start, end))
+
+            # 情况A-2：整个词在高危词表中
+            if word in self.high_risk_words:
+                if (start, end) not in matched_ranges:
+                    matches.append(MatchResult(
+                        error=word,
+                        suggestion=None,
+                        error_type='general_high_risk',
+                        position=(start, end),
+                        score=self.high_risk_words[word]
+                    ))
+                    matched_ranges.add((start, end))
+
+            # 情况A-3：整词是“高危专名 + 通用机构后缀”复合词
+            compound_match = self._match_high_risk_compound(word)
+            if compound_match:
+                compound_word, compound_score = compound_match
+                if (start, end) not in matched_ranges:
+                    matches.append(MatchResult(
+                        error=compound_word,
+                        suggestion=None,
+                        error_type='general_high_risk',
+                        position=(start, end),
+                        score=compound_score
+                    ))
+                    matched_ranges.add((start, end))
             
             # 情况B：连续单字组合成混淆对（如"扫"+"瞄"）
             if (
@@ -163,34 +211,58 @@ class FastMedicalCorrectorV2:
                     
                     if combined in self.confusion_pairs:
                         start = combined_positions[0][0]
-                        if start not in matched_positions:
-                            end = combined_positions[-1][1]
+                        end = combined_positions[-1][1]
+                        if (start, end) not in matched_ranges:
                             matches.append(MatchResult(
                                 error=combined,
                                 suggestion=self.confusion_pairs[combined],
                                 error_type='typo',
                                 position=(start, end)
                             ))
-                            matched_positions.add(start)
+                            matched_ranges.add((start, end))
+                        break
+
+                    if combined in self.high_risk_words:
+                        start = combined_positions[0][0]
+                        end = combined_positions[-1][1]
+                        if (start, end) not in matched_ranges:
+                            end = combined_positions[-1][1]
+                            matches.append(MatchResult(
+                                error=combined,
+                                suggestion=None,
+                                error_type='general_high_risk',
+                                position=(start, end),
+                                score=self.high_risk_words[combined]
+                            ))
+                            matched_ranges.add((start, end))
                         break
                     j += 1
 
             i += 1
-        
-        # 策略2：高危词使用原始子串匹配
-        for end_idx, value in self.automaton.iter(text):
-            err_type, err_word, suggestion, *score = value
-            if err_type == 'general_high_risk':
-                start = end_idx - len(err_word) + 1
-                if start not in matched_positions:
+
+        # 策略2：多 token 连续拼接匹配高危词，避免原始子串匹配误报
+        for i in range(len(tokens)):
+            combined = ''
+            start = tokens[i][1]
+            end = tokens[i][2]
+            for j in range(i, min(len(tokens), i + self.max_high_risk_window_tokens)):
+                token, token_start, token_end = tokens[j]
+                if token_start != end and j != i:
+                    break
+                combined += token
+                end = token_end
+
+                if len(combined) > self.max_high_risk_window_chars:
+                    break
+                if combined in self.high_risk_words and (start, end) not in matched_ranges:
                     matches.append(MatchResult(
-                        error=err_word,
+                        error=combined,
                         suggestion=None,
                         error_type='general_high_risk',
-                        position=(start, end_idx + 1),
-                        score=score[0] if score else None
+                        position=(start, end),
+                        score=self.high_risk_words[combined]
                     ))
-                    matched_positions.add(start)
+                    matched_ranges.add((start, end))
         
         matches.sort(key=lambda x: x.position[0])
         return matches
@@ -303,7 +375,7 @@ if __name__ == '__main__':
     test_texts = [
         "左肺上叶前段胸膜下见一微小结节",  # "见一" 不应该被检测
         "双肺文里增粗，异常未见",  # "文里" 应该被检测
-        "建议患者前往阿里巴巴公司",  # "阿里巴巴" 应该被检测
+        "建议患者前往阿里巴巴公司",  # 高危专名+机构后缀复合词，应该被检测
     ]
     
     print("\n测试:")
