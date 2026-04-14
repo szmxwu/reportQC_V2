@@ -692,12 +692,14 @@ def text_extrac_process(report_text:str,version:str='报告', modality:str='CT',
         positive：illness的阴性/阳性/中性属性，即是否存在疾病
         measure，percent，volume：从short_sentence中抽取的数值属性，分别代表长度，百分比，体积
     """
-    if modality=="DX":
+    if modality=="DX" or modality=="CR" or 'DR' in modality or modality=="XA" or "RF" in modality:
         modality="DR"
-    if "MR" in modality:
+    if "MR" in modality or 'NM' in modality:
         modality="MR"
-    if "CT" in modality:
+    if "CT" in modality or 'hologic' in modality.lower():
         modality="CT"
+    if modality not in ['CT', 'MR', 'DR','MG']:
+        modality='CT'
     processed_text=preprocess_text(report_text, version, modality=modality) # 预处理文本，返回预处理后的句子列表
 
 
@@ -823,6 +825,6 @@ if __name__ == '__main__':
     # output_file = BASE_DIR / 'processed_copus' / 'processed_report_data'
     # (result_df[:int(len(result_df)/2)]).to_excel(str(output_file) + "1.xlsx", index=False)
     # (result_df[int(len(result_df)/2):]).to_excel(str(output_file) + "2.xlsx", index=False)
-    test=text_extrac_process(" 鼻腔左侧钩突(位于中鼻甲前上方的骨性突起)形态异常其尖端部分可见一局限性软组织密度影",modality="CT")
+    test=text_extrac_process(" 左旋支：管腔通畅,未见明确狭窄或斑块；左室后支见钙化斑块,管腔狭窄约25-35% ",modality="CT")
     pprint(test)
 

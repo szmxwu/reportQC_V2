@@ -186,7 +186,7 @@ def _get_part_identifier(entity: Dict) -> str:
     """
     获取部位标识符
     
-    优先使用position字段，如果没有则使用partlist的第一个元素
+    优先使用position字段，如果没有则使用partlist的最后一个元素
     """
     position = entity.get('position', '')
     if position:
@@ -197,7 +197,7 @@ def _get_part_identifier(entity: Dict) -> str:
         if isinstance(partlist[0], (list, tuple)):
             return partlist[0][-1] if partlist[0] else ''
         else:
-            return partlist[0]
+            return partlist[-1]
     return ''
 
 
