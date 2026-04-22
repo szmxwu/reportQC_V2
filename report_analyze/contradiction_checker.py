@@ -32,7 +32,12 @@ def _get_word2vec_model():
             
             model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'model', 'finetuned_word2vec.m')
             if os.path.exists(model_path):
-                _wv_model = Word2Vec.load(model_path)
+                # 支持通过环境变量启用 mmap 共享加载（多进程场景减少内存）
+                mmap_mode = os.environ.get('WORD2VEC_MMAP')
+                if mmap_mode:
+                    _wv_model = Word2Vec.load(model_path, mmap=mmap_mode)
+                else:
+                    _wv_model = Word2Vec.load(model_path)
             else:
                 print(f"Word2Vec模型文件不存在: {model_path}")
                 

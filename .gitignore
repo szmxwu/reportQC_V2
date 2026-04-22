@@ -251,3 +251,6 @@ model/*.gz
 # V3 大数据文件
 V3/Auto_knowledgegraph/data/*.jsonl
 V3/Auto_knowledgegraph/data/*.json
+weak_superivision
+.claude
+.vscode

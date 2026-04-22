@@ -825,6 +825,6 @@ if __name__ == '__main__':
     # output_file = BASE_DIR / 'processed_copus' / 'processed_report_data'
     # (result_df[:int(len(result_df)/2)]).to_excel(str(output_file) + "1.xlsx", index=False)
     # (result_df[int(len(result_df)/2):]).to_excel(str(output_file) + "2.xlsx", index=False)
-    test=text_extrac_process(" 左旋支：管腔通畅,未见明确狭窄或斑块；左室后支见钙化斑块,管腔狭窄约25-35% ",modality="CT")
+    test=text_extrac_process(" 骨盆骨质未见异常征象。骨盆骨质形态欠规整 ",modality="CT")
     pprint(test)
 
